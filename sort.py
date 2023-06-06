@@ -2,7 +2,10 @@ import asyncio
 import functools
 import random
 
+import aio_pika.queue
 import pandas as pd
+from aio_pika import Channel, ExchangeType, Message, Exchange
+from aio_pika.abc import AbstractChannel, AbstractExchange
 from lithops import Storage
 import numpy as np
 from typing import List, Dict
@@ -53,51 +56,47 @@ def partition(
     return np.searchsorted(segment_info, partition[sort_key])
 
 
-def exchange_write(
-        storage: Storage,
+async def exchange_write(
+        channel: AbstractChannel,
         partition_obj: pd.DataFrame,
         partition_id: int,
         num_partitions: int,
-        intermediate_bucket: str,
+        exchange: AbstractExchange,
+        queue_prefix: str,
         hash_list: np.ndarray
 ):
     subpartitions = serialize_partitions(num_partitions,
                                          partition_obj,
                                          hash_list)
 
-    _writer_multiple_files(storage=storage,
-                           subpartitions=subpartitions,
-                           partition_id=partition_id,
-                           bucket=intermediate_bucket)
+    await asyncio.gather(
+        *[
+            exchange.publish(
+                message=Message(body=subpartition_data[1]),
+                routing_key=f"{queue_prefix}_{subpartition_data[0]}",
+            )
+            for subpartition_data in subpartitions.items()
+        ]
+    )
 
 
-def exchange_read(
-        storage: Storage,
+async def exchange_read(
+        channel: AbstractChannel,
         partition_id: int,
         num_partitions: int,
-        intermediate_bucket: str) \
+        exchange: AbstractExchange,
+        queue_prefix: str) \
         -> pd.DataFrame:
-    async def reads():
-        map_partitions = list(range(num_partitions))
-        random.shuffle(map_partitions)
+    queue = await channel.declare_queue(f"{queue_prefix}_{partition_id}", durable=True)
+    await queue.bind(exchange, routing_key=f"{queue_prefix}_{partition_id}")
 
-        tasks = [
-            loop.run_in_executor(None, functools.partial(reader,
-                                                         source_partition=map_partition,
-                                                         destiny_partition=partition_id,
-                                                         bucket=intermediate_bucket,
-                                                         storage=storage))
-            for map_partition in map_partitions
-        ]
-
-        objects = await asyncio.gather(
-            *tasks
-        )
-
-        return objects
-
-    loop = asyncio.get_event_loop()
-    res = loop.run_until_complete(reads())
+    res = []
+    for _ in range(num_partitions):
+        message = await queue.get(timeout=None, fail=False)
+        if message is None:
+            break
+        res.append(message.body)
+        await message.ack()
 
     partition_obj = concat_progressive(res)
 
