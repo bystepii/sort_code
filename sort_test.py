@@ -2,6 +2,7 @@ import asyncio
 import glob
 import os
 import random
+from multiprocessing import Process, Pool
 
 from lithops import Storage
 import cloudpickle as pickle
@@ -22,7 +23,7 @@ types = {
 map_partitions = 5
 reduce_partitions = 5
 
-rabbitmq_host = os.getenv('RABBITMQ_HOST', 'localhost')
+rabbitmq_url = 'amqp://guest:guest@localhost:5672/'
 
 exchange_name = 'sort'
 queue_prefix = 'reducer'
@@ -33,9 +34,9 @@ async def sequential_sort(map_partitions: int,
 
     random.seed(0)
 
-    storage = Storage(backend="localhost")
+    storage = Storage()
 
-    connection = await connect_robust(host=rabbitmq_host)
+    connection = await connect_robust(rabbitmq_url)
     channel = await connection.channel()
     exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
     queues = await asyncio.gather(
@@ -51,6 +52,9 @@ async def sequential_sort(map_partitions: int,
         ]
     )
 
+    await channel.close()
+    await connection.close()
+
     sampler = Sample(
         bucket=bucket,
         key=key,
@@ -61,30 +65,52 @@ async def sequential_sort(map_partitions: int,
         types=types
     )
 
-    sampler.set_storage()
+    sampler.set_storage(storage)
 
     segment_info = pickle.loads(sampler.run())
 
-    for partition_id in range(map_partitions):
+    with Pool(processes=max(map_partitions, reduce_partitions)) as pool:
+        pool.starmap(mapper, [
+            (exchange_name, map_partitions, partition_id, reduce_partitions, segment_info)
+            for partition_id in range(map_partitions)
+        ])
+        pool.starmap(reducer, [
+            (exchange_name, map_partitions, partition_id)
+            for partition_id in range(reduce_partitions)
+        ])
 
+    # Remove intermediates
+    for f in glob.glob("/tmp/lithops/sandbox/intermediates/*"):
+        os.remove(f)
+
+
+def mapper(
+        exchange_name: str,
+        map_partitions: int,
+        partition_id: int,
+        reduce_partitions: int,
+        segment_info: list
+):
+    async def _mapper():
+        connection = await connect_robust(rabbitmq_url)
+        channel = await connection.channel()
+        exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
+        storage = Storage()
         # Get partition for this worker from persistent storage (object store)
         partition_obj = scan(
             storage=storage,
             bucket=bucket,
             key=key,
             partition_id=partition_id,
-            num_partitions=5,
+            num_partitions=map_partitions,
             names=names,
             types=types
         )
-
         print(f"Mapper {partition_id} got {len(partition_obj)} rows.")
-
         # Calculate the destination worker for each row
         hash_list = partition(partition=partition_obj,
                               segment_info=segment_info,
                               sort_key=sort_key)
-
         # Write the subpartition corresponding to each worker
         await exchange_write(channel=channel,
                              partition_obj=partition_obj,
@@ -93,10 +119,21 @@ async def sequential_sort(map_partitions: int,
                              exchange=exchange,
                              queue_prefix=queue_prefix,
                              hash_list=hash_list)
+        await channel.close()
+        await connection.close()
+    asyncio.run(_mapper())
 
 
-    for partition_id in range(reduce_partitions):
-
+def reducer(
+        exchange_name: str,
+        map_partitions: int,
+        partition_id: int
+):
+    async def _reducer():
+        connection = await connect_robust(rabbitmq_url)
+        channel = await connection.channel()
+        exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
+        storage = Storage()
         # Read the corresponding subpartitions from each mappers' output, and concat all of them
         partition_obj = await exchange_read(
             channel=channel,
@@ -105,29 +142,22 @@ async def sequential_sort(map_partitions: int,
             exchange=exchange,
             queue_prefix=queue_prefix,
         )
-
         print(f"Reducer {partition_id} got {len(partition_obj)} rows.")
-
         # Sort the partition
         sort(
             partition_obj=partition_obj,
-            sort_key = sort_key
+            sort_key=sort_key
         )
-
         # Write the partition to persistent storage (object store)
         write(
-            storage = storage,
+            storage=storage,
             partition_obj=partition_obj,
             partition_id=partition_id,
             bucket=bucket
         )
-
-    # Remove intermediates
-    for f in glob.glob("/tmp/lithops/sandbox/intermediates/*"):
-        os.remove(f)
-
-    await channel.close()
-    await connection.close()
+        await channel.close()
+        await connection.close()
+    asyncio.run(_reducer())
 
 
 if __name__ == "__main__":

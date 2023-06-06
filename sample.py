@@ -40,8 +40,8 @@ class Sample():
         self.names = names
         self.types = types
 
-    def set_storage(self, backend: str = "localhost"):
-        self.storage = Storage(backend=backend)
+    def set_storage(self, storage: Storage):
+        self.storage = storage
 
     def run(self):
 
