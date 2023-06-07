@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import random
+import time
 
 import aio_pika.queue
 import pandas as pd
@@ -58,17 +59,19 @@ def partition(
 
 async def exchange_write(
         channel: AbstractChannel,
+        storage: Storage,
         partition_obj: pd.DataFrame,
         partition_id: int,
         num_partitions: int,
         exchange: AbstractExchange,
         queue_prefix: str,
+        timestamp_bucket: str,
         hash_list: np.ndarray
 ):
     subpartitions = serialize_partitions(num_partitions,
                                          partition_obj,
                                          hash_list)
-
+    storage.put_object(bucket=timestamp_bucket, key=f"mapper_{partition_id}", body=str(time.time()))
     await asyncio.gather(
         *[
             exchange.publish(
@@ -82,13 +85,14 @@ async def exchange_write(
 
 async def exchange_read(
         channel: AbstractChannel,
+        storage: Storage,
         partition_id: int,
         num_partitions: int,
         exchange: AbstractExchange,
-        queue_prefix: str) \
+        queue_prefix: str,
+        timestamp_bucket: str) \
         -> pd.DataFrame:
     queue = await channel.declare_queue(f"{queue_prefix}_{partition_id}", durable=True)
-    await queue.bind(exchange, routing_key=f"{queue_prefix}_{partition_id}")
 
     res = []
     for _ in range(num_partitions):
@@ -97,6 +101,8 @@ async def exchange_read(
             break
         res.append(message.body)
         await message.ack()
+
+    storage.put_object(bucket=timestamp_bucket, key=f"reducer_{partition_id}", body=str(time.time()))
 
     partition_obj = concat_progressive(res)
 

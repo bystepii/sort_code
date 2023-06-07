@@ -11,8 +11,9 @@ from sort import scan, partition, exchange_write, exchange_read, sort, write
 from aio_pika import connect_robust, ExchangeType
 
 # Assumes data is in "/tmp/lithops/sandbox/terasort-5m"
-bucket = "sandbox"
-intermediate_bucket = "sandbox/intermediates"
+in_bucket = "benchmark-objects"
+out_bucket = "stepan-lithops-sandbox"
+timestamp_bucket = "stepan-lithops-sandbox"
 key = "terasort-5m"
 sort_key = "0"
 names = ["0", "1"]
@@ -56,7 +57,7 @@ async def sequential_sort(map_partitions: int,
     await connection.close()
 
     sampler = Sample(
-        bucket=bucket,
+        bucket=in_bucket,
         key=key,
         sort_key=sort_key,
         num_partitions=reduce_partitions,
@@ -79,9 +80,18 @@ async def sequential_sort(map_partitions: int,
             for partition_id in range(reduce_partitions)
         ])
 
-    # Remove intermediates
-    for f in glob.glob("/tmp/lithops/sandbox/intermediates/*"):
-        os.remove(f)
+    mapper_timestamps = [
+        float(storage.get_object(timestamp_bucket, f"mapper_{i}")) for i in range(map_partitions)
+    ]
+
+    reducers_timestamps = [
+        float(storage.get_object(timestamp_bucket, f"reducer_{i}")) for i in range(reduce_partitions)
+    ]
+
+    print(f"Mapper timestamps: {mapper_timestamps}")
+    print(f"Reducer timestamps: {reducers_timestamps}")
+
+    print(f"Exchange duration: {max(reducers_timestamps) - min(mapper_timestamps)}")
 
 
 def mapper(
@@ -99,7 +109,7 @@ def mapper(
         # Get partition for this worker from persistent storage (object store)
         partition_obj = scan(
             storage=storage,
-            bucket=bucket,
+            bucket=in_bucket,
             key=key,
             partition_id=partition_id,
             num_partitions=map_partitions,
@@ -113,11 +123,13 @@ def mapper(
                               sort_key=sort_key)
         # Write the subpartition corresponding to each worker
         await exchange_write(channel=channel,
+                             storage=storage,
                              partition_obj=partition_obj,
                              partition_id=partition_id,
                              num_partitions=reduce_partitions,
                              exchange=exchange,
                              queue_prefix=queue_prefix,
+                             timestamp_bucket=timestamp_bucket,
                              hash_list=hash_list)
         await channel.close()
         await connection.close()
@@ -137,10 +149,12 @@ def reducer(
         # Read the corresponding subpartitions from each mappers' output, and concat all of them
         partition_obj = await exchange_read(
             channel=channel,
+            storage=storage,
             partition_id=partition_id,
             num_partitions=map_partitions,
             exchange=exchange,
             queue_prefix=queue_prefix,
+            timestamp_bucket=timestamp_bucket,
         )
         print(f"Reducer {partition_id} got {len(partition_obj)} rows.")
         # Sort the partition
@@ -153,7 +167,7 @@ def reducer(
             storage=storage,
             partition_obj=partition_obj,
             partition_id=partition_id,
-            bucket=bucket
+            bucket=out_bucket,
         )
         await channel.close()
         await connection.close()
