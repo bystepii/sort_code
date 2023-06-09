@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+from datetime import datetime
 from multiprocessing import Pool
 
 import cloudpickle as pickle
@@ -15,24 +16,30 @@ from sort import scan, partition, exchange_write, exchange_read, sort, write
 in_bucket = "benchmark-objects"
 out_bucket = "stepan-lithops-sandbox"
 timestamp_bucket = "stepan-lithops-sandbox"
+
+timestamp_prefix = datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
+
+parallel = True
+
 key = "terasort-1g"
+
 sort_key = "0"
 names = ["0", "1"]
 types = {
     "0": "string[pyarrow]",
     "1": "string[pyarrow]"
 }
+
 map_partitions = 6
 reduce_partitions = 6
 
 rabbitmq_url = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
-
 exchange_name = 'sort'
 queue_prefix = 'reducer'
 
 
-async def sequential_sort(map_partitions: int,
-                          reduce_partitions: int):
+async def test_sort(map_partitions: int,
+                    reduce_partitions: int):
 
     random.seed(0)
 
@@ -71,22 +78,35 @@ async def sequential_sort(map_partitions: int,
 
     segment_info = pickle.loads(sampler.run())
 
-    with Pool(processes=max(map_partitions, reduce_partitions)) as pool:
-        pool.starmap(mapper, [
-            (exchange_name, map_partitions, partition_id, reduce_partitions, segment_info)
-            for partition_id in range(map_partitions)
-        ])
-        pool.starmap(reducer, [
-            (exchange_name, map_partitions, partition_id)
-            for partition_id in range(reduce_partitions)
-        ])
+    if not parallel:
+        with Pool(processes=max(map_partitions, reduce_partitions)) as pool:
+            pool.starmap(mapper, [
+                (exchange_name, map_partitions, partition_id, reduce_partitions, segment_info)
+                for partition_id in range(map_partitions)
+            ])
+            pool.starmap(reducer, [
+                (exchange_name, map_partitions, partition_id)
+                for partition_id in range(reduce_partitions)
+            ])
+    else:
+        with Pool(processes=map_partitions+reduce_partitions) as pool:
+            f1 = pool.starmap_async(mapper, [
+                (exchange_name, map_partitions, partition_id, reduce_partitions, segment_info)
+                for partition_id in range(map_partitions)
+            ])
+            f2 = pool.starmap_async(reducer, [
+                (exchange_name, map_partitions, partition_id)
+                for partition_id in range(reduce_partitions)
+            ])
+            f1.get()
+            f2.get()
 
     mapper_timestamps = [
-        float(storage.get_object(timestamp_bucket, f"mapper_{i}")) for i in range(map_partitions)
+        float(storage.get_object(timestamp_bucket, f"{timestamp_prefix}/timestamps/mapper_{i}")) for i in range(map_partitions)
     ]
 
     reducers_timestamps = [
-        float(storage.get_object(timestamp_bucket, f"reducer_{i}")) for i in range(reduce_partitions)
+        float(storage.get_object(timestamp_bucket, f"{timestamp_prefix}/timestamps/reducer_{i}")) for i in range(reduce_partitions)
     ]
 
     print(f"Mapper timestamps: {mapper_timestamps}")
@@ -131,6 +151,7 @@ def mapper(
                              exchange=exchange,
                              queue_prefix=queue_prefix,
                              timestamp_bucket=timestamp_bucket,
+                             timestamp_prefix=f"{timestamp_prefix}/timestamps",
                              hash_list=hash_list)
         await channel.close()
         await connection.close()
@@ -156,6 +177,7 @@ def reducer(
             exchange=exchange,
             queue_prefix=queue_prefix,
             timestamp_bucket=timestamp_bucket,
+            timestamp_prefix=f"{timestamp_prefix}/timestamps",
         )
         print(f"Reducer {partition_id} got {len(partition_obj)} rows.")
         # Sort the partition
@@ -169,6 +191,7 @@ def reducer(
             partition_obj=partition_obj,
             partition_id=partition_id,
             bucket=out_bucket,
+            prefix=timestamp_prefix,
         )
         await channel.close()
         await connection.close()
@@ -177,4 +200,4 @@ def reducer(
 
 if __name__ == "__main__":
     setup_logger(log_level=logging.INFO)
-    asyncio.run(sequential_sort(map_partitions, reduce_partitions))
+    asyncio.run(test_sort(map_partitions, reduce_partitions))

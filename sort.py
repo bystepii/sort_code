@@ -62,12 +62,13 @@ async def exchange_write(
         exchange: AbstractExchange,
         queue_prefix: str,
         timestamp_bucket: str,
+        timestamp_prefix: str,
         hash_list: np.ndarray
 ):
     subpartitions = serialize_partitions(num_partitions,
                                          partition_obj,
                                          hash_list)
-    storage.put_object(bucket=timestamp_bucket, key=f"mapper_{partition_id}", body=str(time.time()))
+    storage.put_object(bucket=timestamp_bucket, key=f"{timestamp_prefix}/mapper_{partition_id}", body=str(time.time()))
     await asyncio.gather(
         *[
             exchange.publish(
@@ -86,19 +87,21 @@ async def exchange_read(
         num_partitions: int,
         exchange: AbstractExchange,
         queue_prefix: str,
-        timestamp_bucket: str) \
+        timestamp_bucket: str,
+        timestamp_prefix: str) \
         -> pd.DataFrame:
     queue = await channel.declare_queue(f"{queue_prefix}_{partition_id}", durable=True)
 
     res = []
-    for _ in range(num_partitions):
-        message = await queue.get(timeout=None, fail=False)
-        if message is None:
-            break
-        res.append(message.body)
-        await message.ack()
+    async with queue.iterator() as queue_iter:
+        async for message in queue_iter:
+            async with message.process():
+                res.append(message.body)
 
-    storage.put_object(bucket=timestamp_bucket, key=f"reducer_{partition_id}", body=str(time.time()))
+                if len(res) == num_partitions:
+                    break
+
+    storage.put_object(bucket=timestamp_bucket, key=f"{timestamp_prefix}/reducer_{partition_id}", body=str(time.time()))
 
     partition_obj = concat_progressive(res)
 
@@ -114,8 +117,9 @@ def write(
         storage: Storage,
         partition_obj: pd.DataFrame,
         partition_id: int,
-        bucket: str):
-    out_key = f"out_{partition_id}"
+        bucket: str,
+        prefix: str):
+    out_key = f"{prefix}/out_{partition_id}"
 
     serialized_partition = serialize(partition_obj)
 
