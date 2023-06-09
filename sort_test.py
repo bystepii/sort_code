@@ -1,30 +1,31 @@
 import asyncio
-import glob
+import logging
 import os
 import random
-from multiprocessing import Process, Pool
+from multiprocessing import Pool
 
-from lithops import Storage
 import cloudpickle as pickle
+from aio_pika import connect_robust, ExchangeType
+from lithops import Storage
+
+from logger import setup_logger
 from sample import Sample
 from sort import scan, partition, exchange_write, exchange_read, sort, write
-from aio_pika import connect_robust, ExchangeType
 
-# Assumes data is in "/tmp/lithops/sandbox/terasort-5m"
 in_bucket = "benchmark-objects"
 out_bucket = "stepan-lithops-sandbox"
 timestamp_bucket = "stepan-lithops-sandbox"
-key = "terasort-5m"
+key = "terasort-1g"
 sort_key = "0"
 names = ["0", "1"]
 types = {
     "0": "string[pyarrow]",
     "1": "string[pyarrow]"
 }
-map_partitions = 5
-reduce_partitions = 5
+map_partitions = 6
+reduce_partitions = 6
 
-rabbitmq_url = 'amqp://guest:guest@localhost:5672/'
+rabbitmq_url = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 
 exchange_name = 'sort'
 queue_prefix = 'reducer'
@@ -175,4 +176,5 @@ def reducer(
 
 
 if __name__ == "__main__":
+    setup_logger(log_level=logging.INFO)
     asyncio.run(sequential_sort(map_partitions, reduce_partitions))

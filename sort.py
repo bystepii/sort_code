@@ -1,19 +1,15 @@
 import asyncio
-import functools
-import random
 import time
-
-import aio_pika.queue
-import pandas as pd
-from aio_pika import Channel, ExchangeType, Message, Exchange
-from aio_pika.abc import AbstractChannel, AbstractExchange
-from lithops import Storage
-import numpy as np
 from typing import List, Dict
 
+import numpy as np
+import pandas as pd
+from aio_pika import Message
+from aio_pika.abc import AbstractChannel, AbstractExchange
+from lithops import Storage
+
 from IO import write_obj
-from utils import _get_read_range, read_and_adjust, get_data_size, serialize_partitions, _writer_multiple_files, \
-    concat_progressive, reader, serialize
+from utils import _get_read_range, read_and_adjust, get_data_size, serialize_partitions, concat_progressive, serialize
 
 
 def scan(storage: Storage,
