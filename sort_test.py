@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import os
-import random
+import statistics
 import time
 from datetime import datetime
 from multiprocessing import Pool
@@ -18,15 +18,15 @@ from sort import scan, partition, exchange_write, exchange_read, sort, write
 
 logger = logging.getLogger(__name__)
 
+NUM_EXECUTIONS = 3
+
 in_bucket = "benchmark-objects"
 out_bucket = "stepan-lithops-sandbox"
 timestamp_bucket = "stepan-lithops-sandbox"
 
-timestamp_prefix = datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
-
 parallel = True
 
-key = "terasort-1g"
+key = "terasort-5m"
 
 sort_key = "0"
 names = ["0", "1"]
@@ -45,8 +45,6 @@ queue_prefix = 'reducer'
 
 async def test_sort(map_partitions: int,
                     reduce_partitions: int):
-
-    random.seed(0)
 
     storage = Storage()
 
@@ -69,78 +67,86 @@ async def test_sort(map_partitions: int,
     await channel.close()
     await connection.close()
 
-    sampler = Sample(
-        bucket=in_bucket,
-        key=key,
-        sort_key=sort_key,
-        num_partitions=reduce_partitions,
-        delimiter=",",
-        names=names,
-        types=types
-    )
+    exchange_times = []
+    mapper_tables = []
+    reducer_tables = []
 
-    sampler.set_storage(storage)
+    for _ in range(NUM_EXECUTIONS):
+        timestamp_prefix = datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
 
-    segment_info = pickle.loads(sampler.run())
+        sampler = Sample(
+            bucket=in_bucket,
+            key=key,
+            sort_key=sort_key,
+            num_partitions=reduce_partitions,
+            delimiter=",",
+            names=names,
+            types=types
+        )
 
-    if not parallel:
-        with Pool(processes=max(map_partitions, reduce_partitions)) as pool:
-            pool.starmap(mapper, [
-                (exchange_name, map_partitions, partition_id, reduce_partitions, segment_info)
-                for partition_id in range(map_partitions)
-            ])
-            pool.starmap(reducer, [
-                (exchange_name, map_partitions, partition_id)
-                for partition_id in range(reduce_partitions)
-            ])
-    else:
-        with Pool(processes=map_partitions+reduce_partitions) as pool:
-            f1 = pool.starmap_async(mapper, [
-                (exchange_name, map_partitions, partition_id, reduce_partitions, segment_info)
-                for partition_id in range(map_partitions)
-            ])
-            f2 = pool.starmap_async(reducer, [
-                (exchange_name, map_partitions, partition_id)
-                for partition_id in range(reduce_partitions)
-            ])
-            f1.get()
-            f2.get()
+        sampler.set_storage(storage)
 
-    mapper_timestamps = [
-        float(storage.get_object(timestamp_bucket, f"{timestamp_prefix}/timestamps/mapper_{i}")) for i in range(map_partitions)
-    ]
+        segment_info = pickle.loads(sampler.run())
 
-    reducers_timestamps = [
-        float(storage.get_object(timestamp_bucket, f"{timestamp_prefix}/timestamps/reducer_{i}")) for i in range(reduce_partitions)
-    ]
+        if not parallel:
+            with Pool(processes=max(map_partitions, reduce_partitions)) as pool:
+                pool.starmap(mapper, [
+                    (exchange_name, map_partitions, partition_id, reduce_partitions, segment_info, timestamp_prefix)
+                    for partition_id in range(map_partitions)
+                ])
+                pool.starmap(reducer, [
+                    (exchange_name, map_partitions, partition_id, timestamp_prefix)
+                    for partition_id in range(reduce_partitions)
+                ])
+        else:
+            with Pool(processes=map_partitions+reduce_partitions) as pool:
+                f1 = pool.starmap_async(mapper, [
+                    (exchange_name, map_partitions, partition_id, reduce_partitions, segment_info, timestamp_prefix)
+                    for partition_id in range(map_partitions)
+                ])
+                f2 = pool.starmap_async(reducer, [
+                    (exchange_name, map_partitions, partition_id, timestamp_prefix)
+                    for partition_id in range(reduce_partitions)
+                ])
+                f1.get()
+                f2.get()
 
-    logger.info(f"Mapper timestamps: {mapper_timestamps}")
-    logger.info(f"Reducer timestamps: {reducers_timestamps}")
+        mappers = [
+            json.loads(storage.get_object(
+                bucket=timestamp_bucket,
+                key=f"{timestamp_prefix}/timestamps/mapper_{i}.json"
+            )) for i in range(map_partitions)
+        ]
+        reducers = [
+            json.loads(storage.get_object(
+                bucket=timestamp_bucket,
+                key=f"{timestamp_prefix}/timestamps/reducer_{i}.json"
+            )) for i in range(reduce_partitions)
+        ]
 
-    logger.info(f"Exchange duration: {max(reducers_timestamps) - min(mapper_timestamps)}")
+        mapper_timestamps = [m["write_start"] for m in mappers]
+        reducers_timestamps = [r["read_finish"] for r in reducers]
+        logger.info(f"Mapper timestamps: {mapper_timestamps}")
+        logger.info(f"Reducer timestamps: {reducers_timestamps}")
+        exchange_time = max(reducers_timestamps) - min(mapper_timestamps)
+        exchange_times.append(exchange_time)
+        logger.info(f"Exchange duration: {exchange_time}")
 
-    mappers = [
-        json.loads(storage.get_object(
-            bucket=timestamp_bucket,
-            key=f"{timestamp_prefix}/timestamps/mapper_{i}.json"
-        )) for i in range(map_partitions)
-    ]
-    reducers = [
-        json.loads(storage.get_object(
-            bucket=timestamp_bucket,
-            key=f"{timestamp_prefix}/timestamps/reducer_{i}.json"
-        )) for i in range(reduce_partitions)
-    ]
+        mapper_table = [[m["scan_time"], m["partition_time"], m["exchange_time"]] for m in mappers]
+        reducer_table = [[r["exchange_time"], r["sort_time"], r["write_time"]] for r in reducers]
+        mapper_tables.append(mapper_table)
+        reducer_tables.append(reducer_table)
 
-    mapper_table = [[m["scan_time"], m["partition_time"], m["exchange_time"]] for m in mappers]
-    reducer_table = [[r["exchange_time"], r["sort_time"], r["write_time"]] for r in reducers]
+    for i in range(NUM_EXECUTIONS):
+        logger.info(f"Mapper table {i}:")
+        print(tabulate(mapper_tables[i], headers=["scan", "partition", "exchange"]))
+        logger.info(f"Reducer table {i}:")
+        print(tabulate(reducer_tables[i], headers=["exchange", "sort", "write"]))
 
-    logger.info("Mapper table:")
-    print(tabulate(mapper_table, headers=["Scan time", "Partition time", "Exchange time"]))
-
-    logger.info("Reducer table:")
-    print(tabulate(reducer_table, headers=["Exchange time", "Sort time", "Write time"]))
-
+    logger.info(f"Exchange times: {exchange_times}")
+    avg = sum(exchange_times) / len(exchange_times)
+    stdev = statistics.stdev(exchange_times)
+    logger.info(f"Exchange time: {avg} ± {stdev} (average ± stdev)")
 
 
 def mapper(
@@ -148,7 +154,8 @@ def mapper(
         map_partitions: int,
         partition_id: int,
         reduce_partitions: int,
-        segment_info: list
+        segment_info: list,
+        timestamp_prefix: str
 ):
     async def _mapper():
         connection = await connect_robust(rabbitmq_url)
@@ -169,7 +176,6 @@ def mapper(
         )
         end = time.time()
         scan_time = end - start
-        logger.info(f"Mapper {partition_id} scan took {scan_time} seconds.")
 
         logger.info(f"Mapper {partition_id} got {len(partition_obj)} rows.")
 
@@ -180,23 +186,18 @@ def mapper(
                               sort_key=sort_key)
         end = time.time()
         partition_time = end - start
-        logger.info(f"Mapper {partition_id} partition took {partition_time} seconds.")
 
         start = time.time()
         # Write the subpartition corresponding to each worker
-        await exchange_write(channel=channel,
-                             storage=storage,
-                             partition_obj=partition_obj,
-                             partition_id=partition_id,
-                             num_partitions=reduce_partitions,
-                             exchange=exchange,
-                             queue_prefix=queue_prefix,
-                             timestamp_bucket=timestamp_bucket,
-                             timestamp_prefix=f"{timestamp_prefix}/timestamps",
-                             hash_list=hash_list)
+        timestamp = await exchange_write(channel=channel,
+                                         partition_obj=partition_obj,
+                                         partition_id=partition_id,
+                                         num_partitions=reduce_partitions,
+                                         exchange=exchange,
+                                         queue_prefix=queue_prefix,
+                                         hash_list=hash_list)
         end = time.time()
         exchange_time = end - start
-        logger.info(f"Mapper {partition_id} exchange write took {exchange_time} seconds.")
 
         storage.put_object(
             bucket=timestamp_bucket,
@@ -204,7 +205,8 @@ def mapper(
             body=json.dumps({
                 "scan_time": scan_time,
                 "partition_time": partition_time,
-                "exchange_time": exchange_time
+                "exchange_time": exchange_time,
+                "write_start": timestamp
             })
         )
 
@@ -216,7 +218,8 @@ def mapper(
 def reducer(
         exchange_name: str,
         map_partitions: int,
-        partition_id: int
+        partition_id: int,
+        timestamp_prefix: str
 ):
     async def _reducer():
         connection = await connect_robust(rabbitmq_url)
@@ -226,19 +229,15 @@ def reducer(
 
         start = time.time()
         # Read the corresponding subpartitions from each mappers' output, and concat all of them
-        partition_obj = await exchange_read(
+        partition_obj, timestamp = await exchange_read(
             channel=channel,
-            storage=storage,
             partition_id=partition_id,
             num_partitions=map_partitions,
             exchange=exchange,
             queue_prefix=queue_prefix,
-            timestamp_bucket=timestamp_bucket,
-            timestamp_prefix=f"{timestamp_prefix}/timestamps",
         )
         end = time.time()
         exchange_time = end - start
-        logger.info(f"Reducer {partition_id} exchange read took {exchange_time} seconds.")
 
         logger.info(f"Reducer {partition_id} got {len(partition_obj)} rows.")
 
@@ -250,7 +249,6 @@ def reducer(
         )
         end = time.time()
         sort_time = end - start
-        logger.info(f"Reducer {partition_id} sort took {sort_time} seconds.")
 
         start = time.time()
         # Write the partition to persistent storage (object store)
@@ -263,7 +261,6 @@ def reducer(
         )
         end = time.time()
         write_time = end - start
-        logger.info(f"Reducer {partition_id} write took {write_time} seconds.")
 
         storage.put_object(
             bucket=timestamp_bucket,
@@ -271,7 +268,8 @@ def reducer(
             body=json.dumps({
                 "exchange_time": exchange_time,
                 "sort_time": sort_time,
-                "write_time": write_time
+                "write_time": write_time,
+                "read_finish": timestamp
             })
         )
 

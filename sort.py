@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -55,20 +55,17 @@ def partition(
 
 async def exchange_write(
         channel: AbstractChannel,
-        storage: Storage,
         partition_obj: pd.DataFrame,
         partition_id: int,
         num_partitions: int,
         exchange: AbstractExchange,
         queue_prefix: str,
-        timestamp_bucket: str,
-        timestamp_prefix: str,
         hash_list: np.ndarray
-):
+) -> float:
     subpartitions = serialize_partitions(num_partitions,
                                          partition_obj,
                                          hash_list)
-    storage.put_object(bucket=timestamp_bucket, key=f"{timestamp_prefix}/mapper_{partition_id}", body=str(time.time()))
+    timestamp = time.time()
     await asyncio.gather(
         *[
             exchange.publish(
@@ -78,18 +75,16 @@ async def exchange_write(
             for subpartition_data in subpartitions.items()
         ]
     )
+    return timestamp
 
 
 async def exchange_read(
         channel: AbstractChannel,
-        storage: Storage,
         partition_id: int,
         num_partitions: int,
         exchange: AbstractExchange,
-        queue_prefix: str,
-        timestamp_bucket: str,
-        timestamp_prefix: str) \
-        -> pd.DataFrame:
+        queue_prefix: str) \
+        -> Tuple[pd.DataFrame, float]:
     queue = await channel.declare_queue(f"{queue_prefix}_{partition_id}", durable=True)
 
     res = []
@@ -101,11 +96,11 @@ async def exchange_read(
                 if len(res) == num_partitions:
                     break
 
-    storage.put_object(bucket=timestamp_bucket, key=f"{timestamp_prefix}/reducer_{partition_id}", body=str(time.time()))
+    timestamp = time.time()
 
     partition_obj = concat_progressive(res)
 
-    return partition_obj
+    return partition_obj, timestamp
 
 
 def sort(partition_obj: pd.DataFrame,
