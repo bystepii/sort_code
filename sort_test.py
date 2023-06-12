@@ -1,17 +1,22 @@
 import asyncio
+import json
 import logging
 import os
 import random
+import time
 from datetime import datetime
 from multiprocessing import Pool
 
 import cloudpickle as pickle
 from aio_pika import connect_robust, ExchangeType
 from lithops import Storage
+from tabulate import tabulate
 
 from logger import setup_logger
 from sample import Sample
 from sort import scan, partition, exchange_write, exchange_read, sort, write
+
+logger = logging.getLogger(__name__)
 
 in_bucket = "benchmark-objects"
 out_bucket = "stepan-lithops-sandbox"
@@ -109,10 +114,33 @@ async def test_sort(map_partitions: int,
         float(storage.get_object(timestamp_bucket, f"{timestamp_prefix}/timestamps/reducer_{i}")) for i in range(reduce_partitions)
     ]
 
-    print(f"Mapper timestamps: {mapper_timestamps}")
-    print(f"Reducer timestamps: {reducers_timestamps}")
+    logger.info(f"Mapper timestamps: {mapper_timestamps}")
+    logger.info(f"Reducer timestamps: {reducers_timestamps}")
 
-    print(f"Exchange duration: {max(reducers_timestamps) - min(mapper_timestamps)}")
+    logger.info(f"Exchange duration: {max(reducers_timestamps) - min(mapper_timestamps)}")
+
+    mappers = [
+        json.loads(storage.get_object(
+            bucket=timestamp_bucket,
+            key=f"{timestamp_prefix}/timestamps/mapper_{i}.json"
+        )) for i in range(map_partitions)
+    ]
+    reducers = [
+        json.loads(storage.get_object(
+            bucket=timestamp_bucket,
+            key=f"{timestamp_prefix}/timestamps/reducer_{i}.json"
+        )) for i in range(reduce_partitions)
+    ]
+
+    mapper_table = [[m["scan_time"], m["partition_time"], m["exchange_time"]] for m in mappers]
+    reducer_table = [[r["exchange_time"], r["sort_time"], r["write_time"]] for r in reducers]
+
+    logger.info("Mapper table:")
+    print(tabulate(mapper_table, headers=["Scan time", "Partition time", "Exchange time"]))
+
+    logger.info("Reducer table:")
+    print(tabulate(reducer_table, headers=["Exchange time", "Sort time", "Write time"]))
+
 
 
 def mapper(
@@ -127,6 +155,8 @@ def mapper(
         channel = await connection.channel()
         exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
         storage = Storage()
+
+        start = time.time()
         # Get partition for this worker from persistent storage (object store)
         partition_obj = scan(
             storage=storage,
@@ -137,11 +167,22 @@ def mapper(
             names=names,
             types=types
         )
-        print(f"Mapper {partition_id} got {len(partition_obj)} rows.")
+        end = time.time()
+        scan_time = end - start
+        logger.info(f"Mapper {partition_id} scan took {scan_time} seconds.")
+
+        logger.info(f"Mapper {partition_id} got {len(partition_obj)} rows.")
+
+        start = time.time()
         # Calculate the destination worker for each row
         hash_list = partition(partition=partition_obj,
                               segment_info=segment_info,
                               sort_key=sort_key)
+        end = time.time()
+        partition_time = end - start
+        logger.info(f"Mapper {partition_id} partition took {partition_time} seconds.")
+
+        start = time.time()
         # Write the subpartition corresponding to each worker
         await exchange_write(channel=channel,
                              storage=storage,
@@ -153,6 +194,20 @@ def mapper(
                              timestamp_bucket=timestamp_bucket,
                              timestamp_prefix=f"{timestamp_prefix}/timestamps",
                              hash_list=hash_list)
+        end = time.time()
+        exchange_time = end - start
+        logger.info(f"Mapper {partition_id} exchange write took {exchange_time} seconds.")
+
+        storage.put_object(
+            bucket=timestamp_bucket,
+            key=f"{timestamp_prefix}/timestamps/mapper_{partition_id}.json",
+            body=json.dumps({
+                "scan_time": scan_time,
+                "partition_time": partition_time,
+                "exchange_time": exchange_time
+            })
+        )
+
         await channel.close()
         await connection.close()
     asyncio.run(_mapper())
@@ -168,6 +223,8 @@ def reducer(
         channel = await connection.channel()
         exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
         storage = Storage()
+
+        start = time.time()
         # Read the corresponding subpartitions from each mappers' output, and concat all of them
         partition_obj = await exchange_read(
             channel=channel,
@@ -179,12 +236,23 @@ def reducer(
             timestamp_bucket=timestamp_bucket,
             timestamp_prefix=f"{timestamp_prefix}/timestamps",
         )
-        print(f"Reducer {partition_id} got {len(partition_obj)} rows.")
+        end = time.time()
+        exchange_time = end - start
+        logger.info(f"Reducer {partition_id} exchange read took {exchange_time} seconds.")
+
+        logger.info(f"Reducer {partition_id} got {len(partition_obj)} rows.")
+
+        start = time.time()
         # Sort the partition
         sort(
             partition_obj=partition_obj,
             sort_key=sort_key
         )
+        end = time.time()
+        sort_time = end - start
+        logger.info(f"Reducer {partition_id} sort took {sort_time} seconds.")
+
+        start = time.time()
         # Write the partition to persistent storage (object store)
         write(
             storage=storage,
@@ -193,6 +261,20 @@ def reducer(
             bucket=out_bucket,
             prefix=timestamp_prefix,
         )
+        end = time.time()
+        write_time = end - start
+        logger.info(f"Reducer {partition_id} write took {write_time} seconds.")
+
+        storage.put_object(
+            bucket=timestamp_bucket,
+            key=f"{timestamp_prefix}/timestamps/reducer_{partition_id}.json",
+            body=json.dumps({
+                "exchange_time": exchange_time,
+                "sort_time": sort_time,
+                "write_time": write_time
+            })
+        )
+
         await channel.close()
         await connection.close()
     asyncio.run(_reducer())
