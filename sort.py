@@ -1,4 +1,6 @@
 import asyncio
+import functools
+import random
 import time
 from typing import List, Dict, Tuple
 
@@ -9,7 +11,8 @@ from aio_pika.abc import AbstractChannel, AbstractExchange
 from lithops import Storage
 
 from IO import write_obj
-from utils import _get_read_range, read_and_adjust, get_data_size, serialize_partitions, concat_progressive, serialize
+from utils import _get_read_range, read_and_adjust, get_data_size, serialize_partitions, concat_progressive,\
+    serialize, reader
 
 
 def scan(storage: Storage,
@@ -53,7 +56,7 @@ def partition(
     return np.searchsorted(segment_info, partition[sort_key])
 
 
-async def exchange_write(
+async def exchange_write_rabbitmq(
         channel: AbstractChannel,
         partition_obj: pd.DataFrame,
         partition_id: int,
@@ -78,7 +81,7 @@ async def exchange_write(
     return timestamp
 
 
-async def exchange_read(
+async def exchange_read_rabbitmq(
         channel: AbstractChannel,
         partition_id: int,
         num_partitions: int,
@@ -99,6 +102,65 @@ async def exchange_read(
     timestamp = time.time()
 
     partition_obj = concat_progressive(res)
+
+    return partition_obj, timestamp
+
+
+async def exchange_write_s3(
+        storage: Storage,
+        partition_obj: pd.DataFrame,
+        partition_id: int,
+        num_partitions: int,
+        intermediate_bucket: str,
+        hash_list: np.ndarray,
+        timestamp_prefix: str
+) -> float:
+    subpartitions = serialize_partitions(num_partitions,
+                                         partition_obj,
+                                         hash_list)
+    loop = asyncio.get_event_loop()
+
+    timestamp = time.time()
+    await asyncio.gather(
+        *[
+            loop.run_in_executor(None, functools.partial(write_obj,
+                                                         storage=storage,
+                                                         Bucket=intermediate_bucket,
+                                                         Key=f"{timestamp_prefix}/intermediates/{partition_id}",
+                                                         sufixes=[str(subpartition_data[0])],
+                                                         Body=subpartition_data[1]))
+            for subpartition_data in subpartitions.items()
+        ]
+    )
+    return timestamp
+
+
+async def exchange_read_s3(
+        storage: Storage,
+        partition_id: int,
+        num_partitions: int,
+        intermediate_bucket: str,
+        timestamp_prefix: str) \
+        -> Tuple[pd.DataFrame, float]:
+    map_partitions = list(range(num_partitions))
+    random.shuffle(map_partitions)
+
+    loop = asyncio.get_event_loop()
+    objects = await asyncio.gather(
+        *[
+            loop.run_in_executor(None, functools.partial(reader,
+                                                         source_partition=map_partition,
+                                                         destiny_partition=partition_id,
+                                                         bucket=intermediate_bucket,
+                                                         storage=storage,
+                                                         prefix=f"{timestamp_prefix}/intermediates"))
+            for map_partition in map_partitions
+        ]
+    )
+
+    timestamp = time.time()
+
+    partition_obj = concat_progressive(objects)
 
     return partition_obj, timestamp
 

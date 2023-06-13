@@ -235,7 +235,8 @@ def concat_progressive(
 def reader(source_partition: int,
            destiny_partition: int,
            bucket: str,
-           storage: Storage) \
+           storage: Storage,
+           prefix: str) \
         -> bytes:
 
     retry = 0
@@ -249,7 +250,7 @@ def reader(source_partition: int,
             data = read_obj(
                 storage=storage,
                 Bucket=bucket,
-                Key = str(source_partition),
+                Key=f"{prefix}/{source_partition}",
                 sufixes=[str(destiny_partition)]
             )
 

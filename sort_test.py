@@ -14,7 +14,8 @@ from tabulate import tabulate
 
 from logger import setup_logger
 from sample import Sample
-from sort import scan, partition, exchange_write, exchange_read, sort, write
+from sort import scan, partition, exchange_write_rabbitmq, exchange_read_rabbitmq, sort, write, exchange_write_s3, \
+    exchange_read_s3
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +24,11 @@ NUM_EXECUTIONS = 3
 in_bucket = "benchmark-objects"
 out_bucket = "stepan-lithops-sandbox"
 timestamp_bucket = "stepan-lithops-sandbox"
+intermediate_bucket = "stepan-lithops-sandbox"
 
-parallel = True
+parallel = False
 
-key = "terasort-5m"
+key = "terasort-1g"
 
 sort_key = "0"
 names = ["0", "1"]
@@ -42,30 +44,33 @@ rabbitmq_url = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672
 exchange_name = 'sort'
 queue_prefix = 'reducer'
 
+use_rabbitmq = False
+
 
 async def test_sort(map_partitions: int,
                     reduce_partitions: int):
 
     storage = Storage()
 
-    connection = await connect_robust(rabbitmq_url)
-    channel = await connection.channel()
-    exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
-    queues = await asyncio.gather(
-        *[
-            channel.declare_queue(f"{queue_prefix}_{partition_id}", durable=True)
-            for partition_id in range(reduce_partitions)
-        ]
-    )
-    await asyncio.gather(
-        *[
-            queue.bind(exchange, routing_key=f"{queue_prefix}_{partition_id}")
-            for partition_id, queue in enumerate(queues)
-        ]
-    )
+    if use_rabbitmq:
+        connection = await connect_robust(rabbitmq_url)
+        channel = await connection.channel()
+        exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
+        queues = await asyncio.gather(
+            *[
+                channel.declare_queue(f"{queue_prefix}_{partition_id}", durable=True)
+                for partition_id in range(reduce_partitions)
+            ]
+        )
+        await asyncio.gather(
+            *[
+                queue.bind(exchange, routing_key=f"{queue_prefix}_{partition_id}")
+                for partition_id, queue in enumerate(queues)
+            ]
+        )
 
-    await channel.close()
-    await connection.close()
+        await channel.close()
+        await connection.close()
 
     exchange_times = []
     mapper_tables = []
@@ -158,9 +163,10 @@ def mapper(
         timestamp_prefix: str
 ):
     async def _mapper():
-        connection = await connect_robust(rabbitmq_url)
-        channel = await connection.channel()
-        exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
+        if use_rabbitmq:
+            connection = await connect_robust(rabbitmq_url)
+            channel = await connection.channel()
+            exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
         storage = Storage()
 
         start = time.time()
@@ -189,13 +195,22 @@ def mapper(
 
         start = time.time()
         # Write the subpartition corresponding to each worker
-        timestamp = await exchange_write(channel=channel,
-                                         partition_obj=partition_obj,
-                                         partition_id=partition_id,
-                                         num_partitions=reduce_partitions,
-                                         exchange=exchange,
-                                         queue_prefix=queue_prefix,
-                                         hash_list=hash_list)
+        if use_rabbitmq:
+            timestamp = await exchange_write_rabbitmq(channel=channel,
+                                                      partition_obj=partition_obj,
+                                                      partition_id=partition_id,
+                                                      num_partitions=reduce_partitions,
+                                                      exchange=exchange,
+                                                      queue_prefix=queue_prefix,
+                                                      hash_list=hash_list)
+        else:
+            timestamp = await exchange_write_s3(storage=storage,
+                                                partition_obj=partition_obj,
+                                                partition_id=partition_id,
+                                                num_partitions=reduce_partitions,
+                                                intermediate_bucket=intermediate_bucket,
+                                                hash_list=hash_list,
+                                                timestamp_prefix=timestamp_prefix)
         end = time.time()
         exchange_time = end - start
 
@@ -210,8 +225,9 @@ def mapper(
             })
         )
 
-        await channel.close()
-        await connection.close()
+        if use_rabbitmq:
+            await channel.close()
+            await connection.close()
     asyncio.run(_mapper())
 
 
@@ -222,20 +238,31 @@ def reducer(
         timestamp_prefix: str
 ):
     async def _reducer():
-        connection = await connect_robust(rabbitmq_url)
-        channel = await connection.channel()
-        exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
+        if use_rabbitmq:
+            connection = await connect_robust(rabbitmq_url)
+            channel = await connection.channel()
+            exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
+
         storage = Storage()
 
         start = time.time()
         # Read the corresponding subpartitions from each mappers' output, and concat all of them
-        partition_obj, timestamp = await exchange_read(
-            channel=channel,
-            partition_id=partition_id,
-            num_partitions=map_partitions,
-            exchange=exchange,
-            queue_prefix=queue_prefix,
-        )
+        if use_rabbitmq:
+            partition_obj, timestamp = await exchange_read_rabbitmq(
+                channel=channel,
+                partition_id=partition_id,
+                num_partitions=map_partitions,
+                exchange=exchange,
+                queue_prefix=queue_prefix,
+            )
+        else:
+            partition_obj, timestamp = await exchange_read_s3(
+                storage=storage,
+                partition_id=partition_id,
+                num_partitions=map_partitions,
+                intermediate_bucket=intermediate_bucket,
+                timestamp_prefix=timestamp_prefix,
+            )
         end = time.time()
         exchange_time = end - start
 
@@ -273,8 +300,9 @@ def reducer(
             })
         )
 
-        await channel.close()
-        await connection.close()
+        if use_rabbitmq:
+            await channel.close()
+            await connection.close()
     asyncio.run(_reducer())
 
 
