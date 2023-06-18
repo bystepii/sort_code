@@ -3,6 +3,7 @@ import functools
 import gc
 import http
 import io
+import logging
 from math import floor
 
 from botocore.exceptions import ClientError
@@ -12,6 +13,7 @@ import pandas as pd
 import time
 from io import BytesIO, StringIO
 import numpy as np
+from lithops.storage.utils import StorageNoSuchKeyError
 
 from IO import write_obj, read_obj
 
@@ -19,9 +21,11 @@ KB = 1024
 MB = 1024 * KB
 GB = 1024 * MB
 BOUND_EXTRACTION_MARGIN = KB
-MAX_RETRIES: int = 5
-MAX_READ_TIME: int = 15
-RETRY_WAIT_TIME: float = 2.5
+MAX_RETRIES: int = 15
+MAX_READ_TIME: int = 30
+RETRY_WAIT_TIME: float = 0.5
+
+logger = logging.getLogger(__name__)
 
 def adjust_bounds(part: Union[str, bytes],
                   start_byte: int,
@@ -254,26 +258,32 @@ def reader(source_partition: int,
                 sufixes=[str(destiny_partition)]
             )
 
+            logger.info(f"Read {len(data)} bytes")
+
             return data
 
 
         except ClientError as ex:
-
             if ex.response['Error']['Code'] == 'NoSuchKey':
                 if time.time() - before_readt > MAX_READ_TIME:
                     return None
             time.sleep(RETRY_WAIT_TIME)
             continue
 
-        except (http.client.IncompleteRead) as e:
+        except StorageNoSuchKeyError as ex:
+            if time.time() - before_readt > MAX_READ_TIME:
+                return None
+            time.sleep(RETRY_WAIT_TIME)
+            continue
 
+        except (http.client.IncompleteRead) as e:
             if retry == MAX_RETRIES:
                 return None
             retry += 1
             continue
 
         except Exception as e:
-
+            logger.error(f"Caught exception {e}", exc_info=True)
             print(e)
 
             return None

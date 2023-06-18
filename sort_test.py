@@ -26,7 +26,7 @@ out_bucket = "stepan-lithops-sandbox"
 timestamp_bucket = "stepan-lithops-sandbox"
 intermediate_bucket = "stepan-lithops-sandbox"
 
-parallel = False
+parallel = True
 
 key = "terasort-1g"
 
@@ -44,7 +44,7 @@ rabbitmq_url = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672
 exchange_name = 'sort'
 queue_prefix = 'reducer'
 
-use_rabbitmq = False
+use_rabbitmq = True
 
 
 async def test_sort(map_partitions: int,
