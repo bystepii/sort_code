@@ -1,3 +1,4 @@
 aio-pika
 pyarrow
 tabulate
+click

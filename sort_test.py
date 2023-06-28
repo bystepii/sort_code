@@ -1,117 +1,126 @@
 import asyncio
+import functools
 import json
 import logging
 import os
+import random
 import statistics
 import time
 from datetime import datetime
-from multiprocessing import Pool
+from multiprocessing import Pool, Queue, Manager
+from typing import List, Dict
 
+import click
 import cloudpickle as pickle
-from aio_pika import connect_robust, ExchangeType
+from aio_pika import connect_robust, ExchangeType, Message
 from lithops import Storage
 from tabulate import tabulate
 
+from IO import write_obj
+from config import NUM_EXECUTIONS, in_bucket, out_bucket, timestamp_bucket, intermediate_bucket, parallel, \
+    use_rabbitmq, key, burst_size, total_workers, exchange_name, queue_prefix, sort_key, names, types
 from logger import setup_logger
-from sample import Sample
-from sort import scan, partition, exchange_write_rabbitmq, exchange_read_rabbitmq, sort, write, exchange_write_s3, \
-    exchange_read_s3
+from sort import scan, partition, sort, write
+from utils import serialize_partitions, reader, concat_progressive
 
 logger = logging.getLogger(__name__)
 
-NUM_EXECUTIONS = 3
 
-in_bucket = "benchmark-objects"
-out_bucket = "stepan-lithops-sandbox"
-timestamp_bucket = "stepan-lithops-sandbox"
-intermediate_bucket = "stepan-lithops-sandbox"
-
-parallel = True
-
-key = "terasort-1g"
-
-sort_key = "0"
-names = ["0", "1"]
-types = {
-    "0": "string[pyarrow]",
-    "1": "string[pyarrow]"
-}
-
-map_partitions = 6
-reduce_partitions = 6
-
-rabbitmq_url = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
-exchange_name = 'sort'
-queue_prefix = 'reducer'
-
-use_rabbitmq = True
-
-
-async def test_sort(map_partitions: int,
-                    reduce_partitions: int):
-
+async def test_sort(
+        servers: List[str],
+        burst_size: int,
+        total_workers: int,
+        server_id: int,
+):
     storage = Storage()
 
-    if use_rabbitmq:
-        connection = await connect_robust(rabbitmq_url)
-        channel = await connection.channel()
-        exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
-        queues = await asyncio.gather(
-            *[
-                channel.declare_queue(f"{queue_prefix}_{partition_id}", durable=True)
-                for partition_id in range(reduce_partitions)
-            ]
-        )
-        await asyncio.gather(
-            *[
-                queue.bind(exchange, routing_key=f"{queue_prefix}_{partition_id}")
-                for partition_id, queue in enumerate(queues)
-            ]
-        )
+    process_range = range(burst_size * server_id, burst_size * (server_id + 1))
 
-        await channel.close()
-        await connection.close()
+    # setup rabbitmq for the server with id burst_id
+    # each server has burst_size queues, each queue is bound to a different reducer
+    if use_rabbitmq:
+        async def setup_rabbitmq(server: str, num_reducers: int, server_id: int):
+            connection = await connect_robust(server)
+            channel = await connection.channel()
+            exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
+            queues = await asyncio.gather(
+                *[
+                    # the queue name is queue_prefix_0, queue_prefix_1, ..., queue_prefix_(num_reducers - 1)
+                    channel.declare_queue(f"{queue_prefix}_{reducer_id}", durable=True)
+                    for reducer_id in process_range
+                ]
+            )
+            await asyncio.gather(
+                *[
+                    queue.bind(exchange, routing_key=queue.name)
+                    for queue in queues
+                ]
+            )
+
+            await channel.close()
+            await connection.close()
+
+        await setup_rabbitmq(servers[server_id], burst_size, server_id)
 
     exchange_times = []
     mapper_tables = []
     reducer_tables = []
 
+    # sampler = Sample(
+    #     bucket=in_bucket,
+    #     key=key,
+    #     sort_key=sort_key,
+    #     num_partitions=total_workers // 2,
+    #     delimiter=",",
+    #     names=names,
+    #     types=types
+    # )
+    #
+    # sampler.set_storage(storage)
+    #
+    # segment_info = pickle.loads(sampler.run())
+
+    segment_info = pickle.loads(storage.get_object(
+        bucket=intermediate_bucket, key=f"{key}/{total_workers}/segment_info.pkl"
+    ))
+
+    # there are total_workers // 2 mappers and total_workers // 2 reducers
+    map_partitions = reduce_partitions = total_workers // 2
+
+    logger.info(f"process range: {process_range}")
+    m = Manager()
+
     for _ in range(NUM_EXECUTIONS):
-        timestamp_prefix = datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
+        timestamp_prefix = f"{datetime.now().strftime('%Y-%m-%d-%H-%M')}-{_}"
 
-        sampler = Sample(
-            bucket=in_bucket,
-            key=key,
-            sort_key=sort_key,
-            num_partitions=reduce_partitions,
-            delimiter=",",
-            names=names,
-            types=types
-        )
-
-        sampler.set_storage(storage)
-
-        segment_info = pickle.loads(sampler.run())
+        queues = {
+            partition_id: m.Queue()
+            for partition_id in process_range
+        }
 
         if not parallel:
-            with Pool(processes=max(map_partitions, reduce_partitions)) as pool:
+            with Pool(processes=burst_size) as pool:
                 pool.starmap(mapper, [
-                    (exchange_name, map_partitions, partition_id, reduce_partitions, segment_info, timestamp_prefix)
-                    for partition_id in range(map_partitions)
+                    (servers, queues, exchange_name, map_partitions, partition_id,
+                     server_id, reduce_partitions, segment_info, timestamp_prefix)
+                    for partition_id in process_range
                 ])
                 pool.starmap(reducer, [
-                    (exchange_name, map_partitions, partition_id, timestamp_prefix)
-                    for partition_id in range(reduce_partitions)
+                    (servers, queues, exchange_name, map_partitions, partition_id,
+                     server_id, timestamp_prefix)
+                    for partition_id in process_range
                 ])
         else:
-            with Pool(processes=map_partitions+reduce_partitions) as pool:
+            with Pool(processes=burst_size * 2) as pool:
                 f1 = pool.starmap_async(mapper, [
-                    (exchange_name, map_partitions, partition_id, reduce_partitions, segment_info, timestamp_prefix)
-                    for partition_id in range(map_partitions)
+                    (servers, queues, exchange_name, map_partitions, partition_id,
+                     server_id, reduce_partitions, segment_info, timestamp_prefix)
+                    for partition_id in process_range
                 ])
                 f2 = pool.starmap_async(reducer, [
-                    (exchange_name, map_partitions, partition_id, timestamp_prefix)
-                    for partition_id in range(reduce_partitions)
+                    (servers, queues, exchange_name, map_partitions, partition_id,
+                     server_id, timestamp_prefix)
+                    for partition_id in process_range
                 ])
                 f1.get()
                 f2.get()
@@ -155,18 +164,34 @@ async def test_sort(map_partitions: int,
 
 
 def mapper(
+        servers: List[str],
+        queues: Dict[int, Queue],
         exchange_name: str,
         map_partitions: int,
         partition_id: int,
+        server_id: int,
         reduce_partitions: int,
         segment_info: list,
         timestamp_prefix: str
 ):
     async def _mapper():
+        # setup rabbitmq to reducer
         if use_rabbitmq:
-            connection = await connect_robust(rabbitmq_url)
-            channel = await connection.channel()
-            exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
+            connections = {
+                i: await connect_robust(servers[i])
+                for i in range(len(servers)) if i != server_id
+            }
+            channels = {
+                i: await connection.channel()
+                for i, connection in connections.items()
+            }
+            exchanges = {
+                i: await channel.declare_exchange(
+                    exchange_name, ExchangeType.DIRECT, durable=True
+                )
+                for i, channel in channels.items()
+            }
+
         storage = Storage()
 
         start = time.time()
@@ -195,22 +220,51 @@ def mapper(
 
         start = time.time()
         # Write the subpartition corresponding to each worker
-        if use_rabbitmq:
-            timestamp = await exchange_write_rabbitmq(channel=channel,
-                                                      partition_obj=partition_obj,
-                                                      partition_id=partition_id,
-                                                      num_partitions=reduce_partitions,
-                                                      exchange=exchange,
-                                                      queue_prefix=queue_prefix,
-                                                      hash_list=hash_list)
-        else:
-            timestamp = await exchange_write_s3(storage=storage,
-                                                partition_obj=partition_obj,
-                                                partition_id=partition_id,
-                                                num_partitions=reduce_partitions,
-                                                intermediate_bucket=intermediate_bucket,
-                                                hash_list=hash_list,
-                                                timestamp_prefix=timestamp_prefix)
+        subpartitions = serialize_partitions(
+            reduce_partitions,
+            partition_obj,
+            hash_list
+        )
+
+        futures = []
+        loop = asyncio.get_event_loop()
+
+        timestamp = time.time()
+        for dest_reducer, data in subpartitions.items():
+            dest_server = dest_reducer // (reduce_partitions // len(servers))
+            # if same machine, write to shared memory
+            if dest_server == server_id:
+                futures.append(
+                    loop.run_in_executor(
+                        None,
+                        queues[dest_reducer].put,
+                        data
+                    )
+                )
+            # else write to rabbitmq or s3
+            else:
+                if use_rabbitmq:
+                    futures.append(
+                        exchanges[dest_server].publish(
+                            Message(body=data),
+                            routing_key=f"{queue_prefix}_{dest_reducer}",
+                        )
+                    )
+                else:
+                    futures.append(
+                        loop.run_in_executor(
+                            None,
+                            functools.partial(
+                                write_obj,
+                                storage=storage,
+                                Bucket=intermediate_bucket,
+                                Key=f"{timestamp_prefix}/intermediates/{partition_id}",
+                                sufixes=[str(dest_reducer)],
+                                Body=data
+                            )
+                        )
+                    )
+        await asyncio.gather(*futures)
         end = time.time()
         exchange_time = end - start
 
@@ -226,43 +280,93 @@ def mapper(
         )
 
         if use_rabbitmq:
-            await channel.close()
-            await connection.close()
+            await asyncio.gather(
+                *[channel.close() for channel in channels.values()],
+            )
+            await asyncio.gather(
+                *[connection.close() for connection in connections.values()],
+            )
+
     asyncio.run(_mapper())
 
 
 def reducer(
+        servers: List[str],
+        queues: Dict[int, Queue],
         exchange_name: str,
         map_partitions: int,
         partition_id: int,
+        server_id: int,
         timestamp_prefix: str
 ):
     async def _reducer():
         if use_rabbitmq:
-            connection = await connect_robust(rabbitmq_url)
+            connection = await connect_robust(servers[server_id])
             channel = await connection.channel()
             exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
+            queue = await channel.declare_queue(f"{queue_prefix}_{partition_id}", durable=True)
 
         storage = Storage()
 
         start = time.time()
+
         # Read the corresponding subpartitions from each mappers' output, and concat all of them
+        async def exchange_read_shared_memory():
+            res = []
+            while len(res) < burst_size:
+                data = queues[partition_id].get(block=True)
+                res.append(data)
+            return res
+
+        async def exchange_read_rabbitmq():
+            res = []
+            async with queue.iterator() as queue_iter:
+                async for message in queue_iter:
+                    async with message.process():
+                        res.append(message.body)
+
+                        if len(res) == map_partitions - burst_size:
+                            break
+            return res
+
+        async def exchange_read_s3():
+            map_parts = list(range(map_partitions))
+            random.shuffle(map_parts)
+
+            loop = asyncio.get_event_loop()
+            objects = await asyncio.gather(
+                *[
+                    loop.run_in_executor(
+                        None, functools.partial(
+                            reader,
+                            source_partition=map_partition,
+                            destiny_partition=partition_id,
+                            bucket=intermediate_bucket,
+                            storage=storage,
+                            prefix=f"{timestamp_prefix}/intermediates"
+                        )
+                    )
+                    for map_partition in map_parts
+                ]
+            )
+            return objects
+
+        task1 = asyncio.create_task(
+            exchange_read_shared_memory()
+        )
         if use_rabbitmq:
-            partition_obj, timestamp = await exchange_read_rabbitmq(
-                channel=channel,
-                partition_id=partition_id,
-                num_partitions=map_partitions,
-                exchange=exchange,
-                queue_prefix=queue_prefix,
+            task2 = asyncio.create_task(
+                exchange_read_rabbitmq()
             )
         else:
-            partition_obj, timestamp = await exchange_read_s3(
-                storage=storage,
-                partition_id=partition_id,
-                num_partitions=map_partitions,
-                intermediate_bucket=intermediate_bucket,
-                timestamp_prefix=timestamp_prefix,
+            task2 = asyncio.create_task(
+                exchange_read_s3()
             )
+        await asyncio.gather(task1, task2)
+        timestamp = time.time()
+
+        partition_obj = concat_progressive(task1.result() + task2.result())
+
         end = time.time()
         exchange_time = end - start
 
@@ -303,9 +407,22 @@ def reducer(
         if use_rabbitmq:
             await channel.close()
             await connection.close()
+
     asyncio.run(_reducer())
 
 
-if __name__ == "__main__":
+@click.command()
+@click.argument("servers", nargs=-1)
+@click.option("--server-id", type=int, default=os.environ.get("SERVER_ID", 0), help="Server ID")
+def main(servers: List[str], server_id: int):
     setup_logger(log_level=logging.INFO)
-    asyncio.run(test_sort(map_partitions, reduce_partitions))
+
+    if len(servers) != total_workers // burst_size // 2:
+        logger.error(f"Expected {total_workers // burst_size // 2} servers, got {len(servers)}")
+        exit(1)
+
+    asyncio.run(test_sort(servers, burst_size, total_workers, server_id))
+
+
+if __name__ == "__main__":
+    main()
