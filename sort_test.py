@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 async def test_sort(
-        servers: List[str],
+        rabbitmq_server: str,
         burst_size: int,
         total_workers: int,
         server_id: int,
@@ -39,28 +39,26 @@ async def test_sort(
     # setup rabbitmq for the server with id burst_id
     # each server has burst_size queues, each queue is bound to a different reducer
     if use_rabbitmq:
-        async def setup_rabbitmq(server: str, num_reducers: int, server_id: int):
-            connection = await connect_robust(server)
-            channel = await connection.channel()
-            exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
-            queues = await asyncio.gather(
-                *[
-                    # the queue name is queue_prefix_0, queue_prefix_1, ..., queue_prefix_(num_reducers - 1)
-                    channel.declare_queue(f"{queue_prefix}_{reducer_id}", durable=True)
-                    for reducer_id in process_range
-                ]
-            )
-            await asyncio.gather(
-                *[
-                    queue.bind(exchange, routing_key=queue.name)
-                    for queue in queues
-                ]
-            )
+        connection = await connect_robust(rabbitmq_server)
+        channel = await connection.channel()
+        exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
+        queues = await asyncio.gather(
+            *[
+                # the queue name is queue_prefix_0, queue_prefix_1, ..., queue_prefix_(num_reducers - 1)
+                channel.declare_queue(f"{queue_prefix}_{reducer_id}", durable=True)
+                for reducer_id in process_range
+            ]
+        )
+        await asyncio.gather(
+            *[
+                queue.bind(exchange, routing_key=queue.name)
+                for queue in queues
+            ]
+        )
 
-            await channel.close()
-            await connection.close()
+        await channel.close()
+        await connection.close()
 
-        await setup_rabbitmq(servers[server_id], burst_size, server_id)
 
     exchange_times = []
     mapper_tables = []
@@ -101,24 +99,24 @@ async def test_sort(
         if not parallel:
             with Pool(processes=burst_size) as pool:
                 pool.starmap(mapper, [
-                    (servers, queues, exchange_name, map_partitions, partition_id,
+                    (rabbitmq_server, queues, exchange_name, map_partitions, partition_id,
                      server_id, reduce_partitions, segment_info, timestamp_prefix)
                     for partition_id in process_range
                 ])
                 pool.starmap(reducer, [
-                    (servers, queues, exchange_name, map_partitions, partition_id,
+                    (rabbitmq_server, queues, exchange_name, map_partitions, partition_id,
                      server_id, timestamp_prefix)
                     for partition_id in process_range
                 ])
         else:
             with Pool(processes=burst_size * 2) as pool:
                 f1 = pool.starmap_async(mapper, [
-                    (servers, queues, exchange_name, map_partitions, partition_id,
+                    (rabbitmq_server, queues, exchange_name, map_partitions, partition_id,
                      server_id, reduce_partitions, segment_info, timestamp_prefix)
                     for partition_id in process_range
                 ])
                 f2 = pool.starmap_async(reducer, [
-                    (servers, queues, exchange_name, map_partitions, partition_id,
+                    (rabbitmq_server, queues, exchange_name, map_partitions, partition_id,
                      server_id, timestamp_prefix)
                     for partition_id in process_range
                 ])
@@ -164,7 +162,7 @@ async def test_sort(
 
 
 def mapper(
-        servers: List[str],
+        rabbitmq_server: str,
         queues: Dict[int, Queue],
         exchange_name: str,
         map_partitions: int,
@@ -177,20 +175,9 @@ def mapper(
     async def _mapper():
         # setup rabbitmq to reducer
         if use_rabbitmq:
-            connections = {
-                i: await connect_robust(servers[i])
-                for i in range(len(servers)) if i != server_id
-            }
-            channels = {
-                i: await connection.channel()
-                for i, connection in connections.items()
-            }
-            exchanges = {
-                i: await channel.declare_exchange(
-                    exchange_name, ExchangeType.DIRECT, durable=True
-                )
-                for i, channel in channels.items()
-            }
+            connection = await connect_robust(rabbitmq_server)
+            channel = await connection.channel()
+            exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
 
         storage = Storage()
 
@@ -231,7 +218,7 @@ def mapper(
 
         timestamp = time.time()
         for dest_reducer, data in subpartitions.items():
-            dest_server = dest_reducer // (reduce_partitions // len(servers))
+            dest_server = dest_reducer // burst_size
             # if same machine, write to shared memory
             if dest_server == server_id:
                 futures.append(
@@ -245,7 +232,7 @@ def mapper(
             else:
                 if use_rabbitmq:
                     futures.append(
-                        exchanges[dest_server].publish(
+                        exchange.publish(
                             Message(body=data),
                             routing_key=f"{queue_prefix}_{dest_reducer}",
                         )
@@ -280,18 +267,14 @@ def mapper(
         )
 
         if use_rabbitmq:
-            await asyncio.gather(
-                *[channel.close() for channel in channels.values()],
-            )
-            await asyncio.gather(
-                *[connection.close() for connection in connections.values()],
-            )
+            await channel.close()
+            await connection.close()
 
     asyncio.run(_mapper())
 
 
 def reducer(
-        servers: List[str],
+        rabbitmq_server: str,
         queues: Dict[int, Queue],
         exchange_name: str,
         map_partitions: int,
@@ -301,7 +284,7 @@ def reducer(
 ):
     async def _reducer():
         if use_rabbitmq:
-            connection = await connect_robust(servers[server_id])
+            connection = await connect_robust(rabbitmq_server)
             channel = await connection.channel()
             exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
             queue = await channel.declare_queue(f"{queue_prefix}_{partition_id}", durable=True)
@@ -412,16 +395,16 @@ def reducer(
 
 
 @click.command()
-@click.argument("servers", nargs=-1)
+@click.argument("rabbitmq_server", type=str, default=os.environ.get("RABBITMQ_SERVER", "localhost"), nargs=1)
 @click.option("--server-id", type=int, default=os.environ.get("SERVER_ID", 0), help="Server ID")
-def main(servers: List[str], server_id: int):
+def main(rabbitmq_server: str, server_id: int):
     setup_logger(log_level=logging.INFO)
 
-    if len(servers) != total_workers // burst_size // 2:
-        logger.error(f"Expected {total_workers // burst_size // 2} servers, got {len(servers)}")
+    if server_id >= (total_workers // burst_size // 2):
+        logger.error(f"Server ID {server_id} is invalid. Must be less than {total_workers // burst_size // 2}")
         exit(1)
 
-    asyncio.run(test_sort(servers, burst_size, total_workers, server_id))
+    asyncio.run(test_sort(rabbitmq_server, burst_size, total_workers, server_id))
 
 
 if __name__ == "__main__":
