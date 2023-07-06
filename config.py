@@ -1,6 +1,6 @@
 NUM_EXECUTIONS = 3
 
-in_bucket = "benchmark-objects"
+in_bucket = "stepan-benchmark-objects"
 out_bucket = "stepan-lithops-sandbox"
 timestamp_bucket = "stepan-lithops-sandbox"
 intermediate_bucket = "stepan-lithops-sandbox"
@@ -8,10 +8,10 @@ intermediate_bucket = "stepan-lithops-sandbox"
 parallel = True
 use_rabbitmq = True
 
-key = "terasort-5m"
+key = "terasort-1g"
 
-burst_size = 2
-total_workers = 8
+burst_size = 24
+total_workers = 48
 
 exchange_name = 'sort'
 queue_prefix = 'reducer'

@@ -2,3 +2,4 @@ aio-pika
 pyarrow
 tabulate
 click
+redis

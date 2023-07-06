@@ -1,23 +1,21 @@
 import asyncio
 import functools
-import json
 import logging
 import os
 import random
-import statistics
 import time
 from datetime import datetime
 from multiprocessing import Pool, Queue, Manager
-from typing import List, Dict
+from typing import Dict
 
 import click
 import cloudpickle as pickle
+import redis.asyncio as aioredis
 from aio_pika import connect_robust, ExchangeType, Message
 from lithops import Storage
-from tabulate import tabulate
 
 from IO import write_obj
-from config import NUM_EXECUTIONS, in_bucket, out_bucket, timestamp_bucket, intermediate_bucket, parallel, \
+from config import in_bucket, out_bucket, intermediate_bucket, parallel, \
     use_rabbitmq, key, burst_size, total_workers, exchange_name, queue_prefix, sort_key, names, types
 from logger import setup_logger
 from sort import scan, partition, sort, write
@@ -28,13 +26,23 @@ logger = logging.getLogger(__name__)
 
 async def test_sort(
         rabbitmq_server: str,
+        redis_server: str,
         burst_size: int,
         total_workers: int,
         server_id: int,
+        run: int,
 ):
     storage = Storage()
 
+    logger.info(f"server id: {server_id}")
+    logger.info(f"key: {key}")
+    logger.info(f"burst size: {burst_size}")
+    logger.info(f"total workers: {total_workers}")
+    logger.info(f"using rabbitmq: {use_rabbitmq}")
+    logger.info(f"parallel: {parallel}")
+
     process_range = range(burst_size * server_id, burst_size * (server_id + 1))
+    logger.info(f"process range: {process_range}")
 
     # setup rabbitmq for the server with id burst_id
     # each server has burst_size queues, each queue is bound to a different reducer
@@ -59,11 +67,6 @@ async def test_sort(
         await channel.close()
         await connection.close()
 
-
-    exchange_times = []
-    mapper_tables = []
-    reducer_tables = []
-
     # sampler = Sample(
     #     bucket=in_bucket,
     #     key=key,
@@ -85,84 +88,52 @@ async def test_sort(
     # there are total_workers // 2 mappers and total_workers // 2 reducers
     map_partitions = reduce_partitions = total_workers // 2
 
-    logger.info(f"process range: {process_range}")
     m = Manager()
 
-    for _ in range(NUM_EXECUTIONS):
-        timestamp_prefix = f"{datetime.now().strftime('%Y-%m-%d-%H-%M')}-{_}"
+    timestamp = datetime.now().strftime('%Y-%m-%d-%H-%M')
 
-        queues = {
-            partition_id: m.Queue()
-            for partition_id in process_range
-        }
+    logger.info(f"==================== RUN {run} ====================")
+    timestamp_prefix = f"{timestamp}-{run}"
 
-        if not parallel:
-            with Pool(processes=burst_size) as pool:
-                pool.starmap(mapper, [
-                    (rabbitmq_server, queues, exchange_name, map_partitions, partition_id,
-                     server_id, reduce_partitions, segment_info, timestamp_prefix)
-                    for partition_id in process_range
-                ])
-                pool.starmap(reducer, [
-                    (rabbitmq_server, queues, exchange_name, map_partitions, partition_id,
-                     server_id, timestamp_prefix)
-                    for partition_id in process_range
-                ])
-        else:
-            with Pool(processes=burst_size * 2) as pool:
-                f1 = pool.starmap_async(mapper, [
-                    (rabbitmq_server, queues, exchange_name, map_partitions, partition_id,
-                     server_id, reduce_partitions, segment_info, timestamp_prefix)
-                    for partition_id in process_range
-                ])
-                f2 = pool.starmap_async(reducer, [
-                    (rabbitmq_server, queues, exchange_name, map_partitions, partition_id,
-                     server_id, timestamp_prefix)
-                    for partition_id in process_range
-                ])
-                f1.get()
-                f2.get()
+    queues = {
+        partition_id: m.Queue()
+        for partition_id in process_range
+    }
 
-        mappers = [
-            json.loads(storage.get_object(
-                bucket=timestamp_bucket,
-                key=f"{timestamp_prefix}/timestamps/mapper_{i}.json"
-            )) for i in range(map_partitions)
-        ]
-        reducers = [
-            json.loads(storage.get_object(
-                bucket=timestamp_bucket,
-                key=f"{timestamp_prefix}/timestamps/reducer_{i}.json"
-            )) for i in range(reduce_partitions)
-        ]
+    if not parallel:
+        with Pool(processes=burst_size) as pool:
+            pool.starmap(mapper, [
+                (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
+                 server_id, reduce_partitions, segment_info, timestamp_prefix)
+                for partition_id in process_range
+            ])
+            pool.starmap(reducer, [
+                (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
+                 server_id, timestamp_prefix)
+                for partition_id in process_range
+            ])
+    else:
+        with Pool(processes=burst_size * 2) as pool:
+            f1 = pool.starmap_async(mapper, [
+                (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
+                 server_id, reduce_partitions, segment_info, timestamp_prefix)
+                for partition_id in process_range
+            ])
+            f2 = pool.starmap_async(reducer, [
+                (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
+                 server_id, timestamp_prefix)
+                for partition_id in process_range
+            ])
+            f1.get()
+            f2.get()
 
-        mapper_timestamps = [m["write_start"] for m in mappers]
-        reducers_timestamps = [r["read_finish"] for r in reducers]
-        logger.info(f"Mapper timestamps: {mapper_timestamps}")
-        logger.info(f"Reducer timestamps: {reducers_timestamps}")
-        exchange_time = max(reducers_timestamps) - min(mapper_timestamps)
-        exchange_times.append(exchange_time)
-        logger.info(f"Exchange duration: {exchange_time}")
-
-        mapper_table = [[m["scan_time"], m["partition_time"], m["exchange_time"]] for m in mappers]
-        reducer_table = [[r["exchange_time"], r["sort_time"], r["write_time"]] for r in reducers]
-        mapper_tables.append(mapper_table)
-        reducer_tables.append(reducer_table)
-
-    for i in range(NUM_EXECUTIONS):
-        logger.info(f"Mapper table {i}:")
-        print(tabulate(mapper_tables[i], headers=["scan", "partition", "exchange"]))
-        logger.info(f"Reducer table {i}:")
-        print(tabulate(reducer_tables[i], headers=["exchange", "sort", "write"]))
-
-    logger.info(f"Exchange times: {exchange_times}")
-    avg = sum(exchange_times) / len(exchange_times)
-    stdev = statistics.stdev(exchange_times)
-    logger.info(f"Exchange time: {avg} ± {stdev} (average ± stdev)")
+    logger.info("==================== DONE ====================")
 
 
 def mapper(
         rabbitmq_server: str,
+        redis_server: str,
+        run: int,
         queues: Dict[int, Queue],
         exchange_name: str,
         map_partitions: int,
@@ -255,16 +226,31 @@ def mapper(
         end = time.time()
         exchange_time = end - start
 
-        storage.put_object(
-            bucket=timestamp_bucket,
-            key=f"{timestamp_prefix}/timestamps/mapper_{partition_id}.json",
-            body=json.dumps({
+        r = aioredis.from_url(redis_server)
+
+        await r.hset(
+            f"{run}/mapper/{partition_id}",
+            mapping={
+                "id": partition_id,
                 "scan_time": scan_time,
                 "partition_time": partition_time,
                 "exchange_time": exchange_time,
                 "write_start": timestamp
-            })
+            }
         )
+
+        await r.close()
+
+        # storage.put_object(
+        #     bucket=timestamp_bucket,
+        #     key=f"{timestamp_prefix}/timestamps/mapper_{partition_id}.json",
+        #     body=json.dumps({
+        #         "scan_time": scan_time,
+        #         "partition_time": partition_time,
+        #         "exchange_time": exchange_time,
+        #         "write_start": timestamp
+        #     })
+        # )
 
         if use_rabbitmq:
             await channel.close()
@@ -275,6 +261,8 @@ def mapper(
 
 def reducer(
         rabbitmq_server: str,
+        redis_server: str,
+        run: int,
         queues: Dict[int, Queue],
         exchange_name: str,
         map_partitions: int,
@@ -303,6 +291,8 @@ def reducer(
 
         async def exchange_read_rabbitmq():
             res = []
+            if map_partitions - burst_size <= 0:
+                return res
             async with queue.iterator() as queue_iter:
                 async for message in queue_iter:
                     async with message.process():
@@ -376,16 +366,31 @@ def reducer(
         end = time.time()
         write_time = end - start
 
-        storage.put_object(
-            bucket=timestamp_bucket,
-            key=f"{timestamp_prefix}/timestamps/reducer_{partition_id}.json",
-            body=json.dumps({
+        r = aioredis.from_url(redis_server)
+
+        await r.hset(
+            f"{run}/reducer/{partition_id}",
+            mapping={
+                "id": partition_id,
                 "exchange_time": exchange_time,
                 "sort_time": sort_time,
                 "write_time": write_time,
                 "read_finish": timestamp
-            })
+            }
         )
+
+        await r.close()
+
+        # storage.put_object(
+        #     bucket=timestamp_bucket,
+        #     key=f"{timestamp_prefix}/timestamps/reducer_{partition_id}.json",
+        #     body=json.dumps({
+        #         "exchange_time": exchange_time,
+        #         "sort_time": sort_time,
+        #         "write_time": write_time,
+        #         "read_finish": timestamp
+        #     })
+        # )
 
         if use_rabbitmq:
             await channel.close()
@@ -397,14 +402,16 @@ def reducer(
 @click.command()
 @click.argument("rabbitmq_server", type=str, default=os.environ.get("RABBITMQ_SERVER", "localhost"), nargs=1)
 @click.option("--server-id", type=int, default=os.environ.get("SERVER_ID", 0), help="Server ID")
-def main(rabbitmq_server: str, server_id: int):
+@click.option("--redis-server", type=str, default=os.environ.get("REDIS_SERVER", "localhost"), help="Redis server")
+@click.option("--run", type=int, default=os.environ.get("RUN", 0), help="Run number")
+def main(rabbitmq_server: str, redis_server: str, server_id: int, run: int):
     setup_logger(log_level=logging.INFO)
 
     if server_id >= (total_workers // burst_size // 2):
         logger.error(f"Server ID {server_id} is invalid. Must be less than {total_workers // burst_size // 2}")
         exit(1)
 
-    asyncio.run(test_sort(rabbitmq_server, burst_size, total_workers, server_id))
+    asyncio.run(test_sort(rabbitmq_server, redis_server, burst_size, total_workers, server_id, run))
 
 
 if __name__ == "__main__":
