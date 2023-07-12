@@ -3,3 +3,5 @@ pyarrow
 tabulate
 click
 redis
+aiormq
+pamqp
