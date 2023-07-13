@@ -31,11 +31,14 @@ def scan(storage: Storage,
                                                partition_id,
                                                num_partitions)
 
+    print("Get read range done")
     total_size = get_data_size(storage,
                                bucket,
                                key)
 
+    print("Get data size done")
     data, _, _ = read_and_adjust(storage=storage,
+                                 chunk_size=1,
                                  read_bucket=bucket,
                                  read_path=key,
                                  lower_bound=lower_bound,
@@ -45,6 +48,7 @@ def scan(storage: Storage,
                                  names=names,
                                  types=types)
 
+    print("Read and adjust done")
     return data
 
 

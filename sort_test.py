@@ -146,7 +146,6 @@ def mapper(
         segment_info: list,
         timestamp_prefix: str
 ):
-    
     async def publish_and_handle_confirm(exchange, queue_name, message_body):
         try:
             confirmation = await exchange.publish(
@@ -161,13 +160,13 @@ def mapper(
                     routing_key=queue_name,
                     timeout=3.0,
                 )
-            
+
             logger.info(f"Acknowledgement received for message!")
         except DeliveryError as e:
             print(f"Delivery of message failed with exception: {e}")
         except TimeoutError:
             print(f"Timeout occured for message")
-                
+
     async def _mapper():
         # setup rabbitmq to reducer
         if use_rabbitmq:
@@ -179,7 +178,8 @@ def mapper(
 
         start = time.time()
         # Get partition for this worker from persistent storage (object store)
-        partition_obj = scan(
+        logger.info(f"Partitions working")
+        list_partitions_obj = scan(
             storage=storage,
             bucket=in_bucket,
             key=key,
@@ -190,30 +190,41 @@ def mapper(
         )
         end = time.time()
         scan_time = end - start
+        logger.info(f"Partitions done")
+        # logger.info(f"Mapper {partition_id} got {len(list_partitions_obj)} chunks.")
 
-        logger.info(f"Mapper {partition_id} got {len(partition_obj)} rows.")
 
-        start = time.time()
         # Calculate the destination worker for each row
-        hash_list = partition(partition=partition_obj,
-                              segment_info=segment_info,
-                              sort_key=sort_key)
+        list_hash_chunks = []
+        start = time.time()
+        
+        for partition_obj in list_partitions_obj:
+            list_hash_chunks.append(partition(partition=partition_obj,
+                                segment_info=segment_info,
+                                sort_key=sort_key))
+            
         end = time.time()
         partition_time = end - start
 
-        start = time.time()
         # Write the subpartition corresponding to each worker
-        subpartitions = serialize_partitions(
-            reduce_partitions,
-            partition_obj,
-            hash_list
-        )
+        list_subpartitions = []
+        start = time.time()
+        
+        for hash_list in list_hash_chunks:
+            list_subpartitions.append(serialize_partitions(
+                reduce_partitions,
+                partition_obj,
+                hash_list
+            ))
 
         futures = []
         loop = asyncio.get_event_loop()
 
         timestamp = time.time()
-        for dest_reducer, data in subpartitions.items():
+        """for subpartitions in list_subpartitions:
+            logger.info(f"Partition")"""
+        for dest_reducer, data in list_subpartitions[0].items():
+            logger.info(f"Data")
             dest_server = dest_reducer // burst_size
             # if same machine, write to shared memory
             if dest_server == server_id:
