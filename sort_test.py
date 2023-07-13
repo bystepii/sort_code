@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import time
+from collections import defaultdict
 from datetime import datetime
 from multiprocessing import Pool, Queue, Manager
 from typing import Dict
@@ -14,7 +15,6 @@ import redis.asyncio as aioredis
 from aio_pika import connect_robust, ExchangeType, Message
 from aio_pika.exceptions import DeliveryError
 from lithops import Storage
-from aiormq.abc import DeliveredMessage
 from pamqp.commands import Basic
 
 from IO import write_obj
@@ -146,28 +146,23 @@ def mapper(
         segment_info: list,
         timestamp_prefix: str
 ):
-    
     async def publish_and_handle_confirm(exchange, queue_name, message_body):
         try:
-            confirmation = await exchange.publish(
-                Message(message_body),
-                routing_key=queue_name,
-                timeout=3.0,
-            )
-
-            while(not isinstance(confirmation, Basic.Ack)):
+            confirmation = None
+            while not isinstance(confirmation, Basic.Ack):
                 confirmation = await exchange.publish(
-                    Message(message_body),
+                    # TODO: add 'chunk_id' to headers, and 'last_chunk' if this is the last chunk
+                    Message(message_body, headers={"partition_id": partition_id}),
                     routing_key=queue_name,
                     timeout=3.0,
                 )
-            
+
             logger.info(f"Acknowledgement received for message!")
         except DeliveryError as e:
             print(f"Delivery of message failed with exception: {e}")
         except TimeoutError:
-            print(f"Timeout occured for message")
-                
+            print(f"Timeout occurred for message")
+
     async def _mapper():
         # setup rabbitmq to reducer
         if use_rabbitmq:
@@ -319,13 +314,31 @@ def reducer(
             res = []
             if map_partitions - burst_size <= 0:
                 return res
+
+            partition_chunks = defaultdict(list)
+            num_partitions = 0
+
             async with queue.iterator() as queue_iter:
                 async for message in queue_iter:
                     async with message.process():
-                        res.append(message.body)
+                        logger.info(f"Received message with headers: {message.headers}")
 
-                        if len(res) == map_partitions - burst_size:
+                        partition_chunks[
+                            message.headers["partition_id"]
+                        ].append((message.headers["chunk_id"], message.body))
+
+                        # If last chunk, increment num_partitions
+                        if 'last_chunk' in message.headers:
+                            num_partitions += 1
+
+                        if num_partitions == map_partitions - burst_size:
                             break
+
+            # Sort chunks by chunk_id and concat them
+            for _, chunks in partition_chunks.items():
+                chunks.sort(key=lambda x: x[0])
+                res.extend([chunk[1] for chunk in chunks])
+
             return res
 
         async def exchange_read_s3():
