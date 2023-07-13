@@ -210,7 +210,7 @@ def mapper(
         list_subpartitions = []
         start = time.time()
         
-        for hash_list in list_hash_chunks:
+        for partition_obj, hash_list in zip(list_partitions_obj, list_hash_chunks):
             list_subpartitions.append(serialize_partitions(
                 reduce_partitions,
                 partition_obj,
