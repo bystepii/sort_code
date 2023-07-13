@@ -1,4 +1,4 @@
-NUM_EXECUTIONS = 3
+NUM_EXECUTIONS = 4
 
 in_bucket = "stepan-benchmark-objects"
 out_bucket = "stepan-lithops-sandbox"
@@ -10,7 +10,7 @@ use_rabbitmq = True
 
 key = "terasort-1g"
 
-burst_size = 24
+burst_size = 1
 total_workers = 48
 
 exchange_name = 'sort'

@@ -12,7 +12,10 @@ import click
 import cloudpickle as pickle
 import redis.asyncio as aioredis
 from aio_pika import connect_robust, ExchangeType, Message
+from aio_pika.exceptions import DeliveryError
 from lithops import Storage
+from aiormq.abc import DeliveredMessage
+from pamqp.commands import Basic
 
 from IO import write_obj
 from config import in_bucket, out_bucket, intermediate_bucket, parallel, \
@@ -48,7 +51,7 @@ async def test_sort(
     # each server has burst_size queues, each queue is bound to a different reducer
     if use_rabbitmq:
         connection = await connect_robust(rabbitmq_server)
-        channel = await connection.channel()
+        channel = await connection.channel(publisher_confirms=True)
         exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
         queues = await asyncio.gather(
             *[
@@ -143,11 +146,33 @@ def mapper(
         segment_info: list,
         timestamp_prefix: str
 ):
+    
+    async def publish_and_handle_confirm(exchange, queue_name, message_body):
+        try:
+            confirmation = await exchange.publish(
+                Message(message_body),
+                routing_key=queue_name,
+                timeout=3.0,
+            )
+
+            while(not isinstance(confirmation, Basic.Ack)):
+                confirmation = await exchange.publish(
+                    Message(message_body),
+                    routing_key=queue_name,
+                    timeout=3.0,
+                )
+            
+            logger.info(f"Acknowledgement received for message!")
+        except DeliveryError as e:
+            print(f"Delivery of message failed with exception: {e}")
+        except TimeoutError:
+            print(f"Timeout occured for message")
+                
     async def _mapper():
         # setup rabbitmq to reducer
         if use_rabbitmq:
             connection = await connect_robust(rabbitmq_server)
-            channel = await connection.channel()
+            channel = await connection.channel(publisher_confirms=True)
             exchange = await channel.declare_exchange(exchange_name, durable=True, type=ExchangeType.DIRECT)
 
         storage = Storage()
@@ -203,9 +228,10 @@ def mapper(
             else:
                 if use_rabbitmq:
                     futures.append(
-                        exchange.publish(
-                            Message(body=data),
-                            routing_key=f"{queue_prefix}_{dest_reducer}",
+                        publish_and_handle_confirm(
+                            exchange,
+                            f"{queue_prefix}_{dest_reducer}",
+                            data,
                         )
                     )
                 else:
