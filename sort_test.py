@@ -148,12 +148,14 @@ def mapper(
 ):
     async def publish_and_handle_confirm(exchange, queue_name, message_body):
         try:
+            # publish the message
             confirmation = await exchange.publish(
                 Message(message_body),
                 routing_key=queue_name,
                 timeout=3.0,
             )
 
+            # if the message was not confirmed, then retry
             while(not isinstance(confirmation, Basic.Ack)):
                 confirmation = await exchange.publish(
                     Message(message_body),
@@ -179,7 +181,7 @@ def mapper(
         start = time.time()
         # Get partition for this worker from persistent storage (object store)
         logger.info(f"Partitions working")
-        list_partitions_obj = scan(
+        list_chunks_partitions_obj = scan(
             storage=storage,
             bucket=in_bucket,
             key=key,
@@ -191,27 +193,27 @@ def mapper(
         end = time.time()
         scan_time = end - start
         logger.info(f"Partitions done")
-        # logger.info(f"Mapper {partition_id} got {len(list_partitions_obj)} chunks.")
+        # logger.info(f"Mapper {partition_id} got {len(list_chunks_partitions_obj)} chunks.")
 
 
         # Calculate the destination worker for each row
-        list_hash_chunks = []
+        list_chunks_hash = []
         start = time.time()
         
-        for partition_obj in list_partitions_obj:
-            list_hash_chunks.append(partition(partition=partition_obj,
+        for partition_obj in list_chunks_partitions_obj:
+            list_chunks_hash.append(partition(partition=partition_obj,
                                 segment_info=segment_info,
                                 sort_key=sort_key))
             
         end = time.time()
         partition_time = end - start
 
-        # Write the subpartition corresponding to each worker
-        list_subpartitions = []
+        # Write the subpartition corresponding to each worker, of each chunk
+        list_subpartitions_chunks = []
         start = time.time()
         
-        for partition_obj, hash_list in zip(list_partitions_obj, list_hash_chunks):
-            list_subpartitions.append(serialize_partitions(
+        for partition_obj, hash_list in zip(list_chunks_partitions_obj, list_chunks_hash):
+            list_subpartitions_chunks.append(serialize_partitions(
                 reduce_partitions,
                 partition_obj,
                 hash_list
@@ -220,45 +222,54 @@ def mapper(
         futures = []
         loop = asyncio.get_event_loop()
 
+        # For every chunk of the message to send
         timestamp = time.time()
-        """for subpartitions in list_subpartitions:
-            logger.info(f"Partition")"""
-        for dest_reducer, data in list_subpartitions[0].items():
-            logger.info(f"Data")
-            dest_server = dest_reducer // burst_size
-            # if same machine, write to shared memory
-            if dest_server == server_id:
-                futures.append(
-                    loop.run_in_executor(
-                        None,
-                        queues[dest_reducer].put,
-                        data
-                    )
-                )
-            # else write to rabbitmq or s3
-            else:
-                if use_rabbitmq:
-                    futures.append(
-                        publish_and_handle_confirm(
-                            exchange,
-                            f"{queue_prefix}_{dest_reducer}",
-                            data,
-                        )
-                    )
-                else:
+        for i, subpartition_chunk in enumerate(list_subpartitions_chunks):
+            last_chunk = False
+            if i == len(list_subpartitions_chunks) - 1:
+                last_chunk = True
+
+            for dest_reducer, data in subpartition_chunk.items():
+                logger.info(f"Partition id {partition_id}")
+                logger.info(f"Chunk id {i}")
+                logger.info(f"Last chunk {last_chunk}")
+                # logger.info(f"Data {data}")
+                logger.info(f"Destination reducer {dest_reducer}")
+
+                dest_server = dest_reducer // burst_size
+                # if same machine, write to shared memory
+                if dest_server == server_id:
                     futures.append(
                         loop.run_in_executor(
                             None,
-                            functools.partial(
-                                write_obj,
-                                storage=storage,
-                                Bucket=intermediate_bucket,
-                                Key=f"{timestamp_prefix}/intermediates/{partition_id}",
-                                sufixes=[str(dest_reducer)],
-                                Body=data
-                            )
+                            queues[dest_reducer].put,
+                            data
                         )
                     )
+                # else write to rabbitmq or s3
+                else:
+                    if use_rabbitmq:
+                        futures.append(
+                            publish_and_handle_confirm(
+                                exchange,
+                                f"{queue_prefix}_{dest_reducer}",
+                                data,
+                            )
+                        )
+                    else:
+                        futures.append(
+                            loop.run_in_executor(
+                                None,
+                                functools.partial(
+                                    write_obj,
+                                    storage=storage,
+                                    Bucket=intermediate_bucket,
+                                    Key=f"{timestamp_prefix}/intermediates/{partition_id}",
+                                    sufixes=[str(dest_reducer)],
+                                    Body=data
+                                )
+                            )
+                        )
         await asyncio.gather(*futures)
         end = time.time()
         exchange_time = end - start

@@ -38,11 +38,11 @@ def scan(storage: Storage,
 
     print("Get data size done")
     data, _, _ = read_and_adjust(storage=storage,
-                                 chunk_size=1,
                                  read_bucket=bucket,
                                  read_path=key,
                                  lower_bound=lower_bound,
                                  upper_bound=upper_bound,
+                                 chunk_size=num_partitions,
                                  total_size=total_size,
                                  delimiter=delimiter,
                                  names=names,

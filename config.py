@@ -10,8 +10,8 @@ use_rabbitmq = True
 
 key = "terasort-1g"
 
-burst_size = 6
-total_workers = 48
+burst_size = 4
+total_workers = 24
 
 exchange_name = 'sort'
 queue_prefix = 'reducer'

@@ -75,11 +75,11 @@ def part_to_IO(read_part) \
 
 
 def read_and_adjust(storage: Storage,
-                    chunk_size: int,
                     read_bucket: str,
                     read_path: str,
                     lower_bound: int,
                     upper_bound: int,
+                    chunk_size: int,
                     total_size: int,
                     delimiter: str = ",",
                     names: List[str] = None,
@@ -184,7 +184,7 @@ def serialize_partitions(num_partitions: int,
     serialized_partitions = {}
 
     for destination_partition in range(num_partitions):
-
+        print("Destination partition: %d" % destination_partition)
         serialization_result = _serialize_partition(destination_partition,
                                                     partition_obj,
                                                     hash_list)
