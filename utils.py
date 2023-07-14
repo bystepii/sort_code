@@ -79,6 +79,7 @@ def read_and_adjust(storage: Storage,
                     read_path: str,
                     lower_bound: int,
                     upper_bound: int,
+                    chunk_size: int,
                     total_size: int,
                     delimiter: str = ",",
                     names: List[str] = None,
@@ -102,16 +103,37 @@ def read_and_adjust(storage: Storage,
     part_length = len(read_part)
 
     read_part = part_to_IO(read_part)
+    
+    if chunk_size is None:
+        df = pd.read_csv(read_part,
+                        engine='c',
+                        index_col=None,
+                        header=None,
+                        delimiter=delimiter,
+                        names=names,
+                        dtype=types,
+                        quoting=3,
+                        on_bad_lines="warn")
+    
+    else:
+        df = []
+        reader_df = pd.read_csv(read_part,
+                        engine='c',
+                        index_col=None,
+                        header=None,
+                        delimiter=delimiter,
+                        names=names,
+                        dtype=types,
+                        quoting=3,
+                        chunksize=chunk_size * 1024 * 1024,
+                        on_bad_lines="warn")
+        
+        # Iterate over each chunk
+        for chunk in reader_df:
+            df.append(chunk)
+            logger.info(f"TYPE CHUNK: {type(chunk)}")
+            logger.info(f"Dataframe: {chunk}")
 
-    df = pd.read_csv(read_part,
-                     engine='c',
-                     index_col=None,
-                     header=None,
-                     delimiter=delimiter,
-                     names=names,
-                     dtype=types,
-                     quoting=3,
-                     on_bad_lines="warn")
 
     return df, part_length, end_time - start_time
 
@@ -162,7 +184,7 @@ def serialize_partitions(num_partitions: int,
     serialized_partitions = {}
 
     for destination_partition in range(num_partitions):
-
+        print("Destination partition: %d" % destination_partition)
         serialization_result = _serialize_partition(destination_partition,
                                                     partition_obj,
                                                     hash_list)
