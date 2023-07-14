@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import itertools
 import logging
 import os
 import random
@@ -7,7 +8,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from multiprocessing import Pool, Queue, Manager
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import click
 import cloudpickle as pickle
@@ -146,13 +147,12 @@ def mapper(
         segment_info: list,
         timestamp_prefix: str
 ):
-    async def publish_and_handle_confirm(exchange, queue_name, message_body):
+    async def publish_and_handle_confirm(exchange, queue_name, message_body, headers):
         try:
             confirmation = None
             while not isinstance(confirmation, Basic.Ack):
                 confirmation = await exchange.publish(
-                    # TODO: add 'chunk_id' to headers, and 'last_chunk' if this is the last chunk
-                    Message(message_body, headers={"partition_id": partition_id}),
+                    Message(message_body, headers=headers),
                     routing_key=queue_name,
                     timeout=3.0,
                 )
@@ -189,23 +189,22 @@ def mapper(
         logger.info(f"Partitions done")
         # logger.info(f"Mapper {partition_id} got {len(list_chunks_partitions_obj)} chunks.")
 
-
         # Calculate the destination worker for each row
         list_chunks_hash = []
         start = time.time()
-        
+
         for partition_obj in list_chunks_partitions_obj:
             list_chunks_hash.append(partition(partition=partition_obj,
-                                segment_info=segment_info,
-                                sort_key=sort_key))
-            
+                                              segment_info=segment_info,
+                                              sort_key=sort_key))
+
         end = time.time()
         partition_time = end - start
 
         # Write the subpartition corresponding to each worker, of each chunk
         list_subpartitions_chunks = []
         start = time.time()
-        
+
         for partition_obj, hash_list in zip(list_chunks_partitions_obj, list_chunks_hash):
             list_subpartitions_chunks.append(serialize_partitions(
                 reduce_partitions,
@@ -224,6 +223,7 @@ def mapper(
                 last_chunk = True
 
             for dest_reducer, data in subpartition_chunk.items():
+                logger.info(f"Data length {len(data)}")
                 logger.info(f"Partition id {partition_id}")
                 logger.info(f"Chunk id {i}")
                 logger.info(f"Last chunk {last_chunk}")
@@ -237,7 +237,12 @@ def mapper(
                         loop.run_in_executor(
                             None,
                             queues[dest_reducer].put,
-                            data
+                            {
+                                "partition_id": partition_id,
+                                "chunk_id": i,
+                                "last_chunk": last_chunk,
+                                "data": data
+                            }
                         )
                     )
                 # else write to rabbitmq or s3
@@ -248,6 +253,11 @@ def mapper(
                                 exchange,
                                 f"{queue_prefix}_{dest_reducer}",
                                 data,
+                                {
+                                    "partition_id": partition_id,
+                                    "chunk_id": i,
+                                    "last_chunk": last_chunk,
+                                }
                             )
                         )
                     else:
@@ -325,19 +335,23 @@ def reducer(
 
         # Read the corresponding subpartitions from each mappers' output, and concat all of them
         async def exchange_read_shared_memory():
-            res = []
-            while len(res) < burst_size:
+            partition_chunks: Dict[str, List[Tuple[int, bytes]]] = defaultdict(list)
+            num_partitions = 0
+
+            while num_partitions < burst_size:
                 data = queues[partition_id].get(block=True)
-                res.append(data)
-            return res
+                logger.info(f"partition_id: {data['partition_id']}, "
+                            f"chunk_id: {data['chunk_id']}, "
+                            f"last_chunk: {data['last_chunk']}")
+                partition_chunks[data['partition_id']].append((data['chunk_id'], data['data']))
+            return partition_chunks
 
         async def exchange_read_rabbitmq():
-            res = []
-            if map_partitions - burst_size <= 0:
-                return res
-
-            partition_chunks = defaultdict(list)
+            partition_chunks: Dict[str, List[Tuple[int, bytes]]] = defaultdict(list)
             num_partitions = 0
+
+            if map_partitions - burst_size <= 0:
+                return partition_chunks
 
             async with queue.iterator() as queue_iter:
                 async for message in queue_iter:
@@ -355,12 +369,7 @@ def reducer(
                         if num_partitions == map_partitions - burst_size:
                             break
 
-            # Sort chunks by chunk_id and concat them
-            for _, chunks in partition_chunks.items():
-                chunks.sort(key=lambda x: x[0])
-                res.extend([chunk[1] for chunk in chunks])
-
-            return res
+            return partition_chunks
 
         async def exchange_read_s3():
             map_parts = list(range(map_partitions))
@@ -398,7 +407,14 @@ def reducer(
         await asyncio.gather(task1, task2)
         timestamp = time.time()
 
-        partition_obj = concat_progressive(task1.result() + task2.result())
+        res = []
+
+        # Sort chunks by chunk_id and concat them
+        for _, chunks in itertools.chain(task1.result().items(), task2.result().items()):
+            chunks.sort(key=lambda x: x[0])
+            res.extend([chunk[1] for chunk in chunks])
+
+        partition_obj = concat_progressive(res)
 
         end = time.time()
         exchange_time = end - start
