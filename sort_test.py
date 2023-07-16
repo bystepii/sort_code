@@ -147,6 +147,7 @@ def mapper(
         segment_info: list,
         timestamp_prefix: str
 ):
+    
     async def publish_and_handle_confirm(exchange, queue_name, message_body, headers):
         try:
             confirmation = None
@@ -156,13 +157,12 @@ def mapper(
                     routing_key=queue_name,
                     timeout=3.0,
                 )
-
             logger.info(f"Acknowledgement received for message!")
         except DeliveryError as e:
             print(f"Delivery of message failed with exception: {e}")
         except TimeoutError:
             print(f"Timeout occurred for message")
-
+                
     async def _mapper():
         # setup rabbitmq to reducer
         if use_rabbitmq:
@@ -174,8 +174,7 @@ def mapper(
 
         start = time.time()
         # Get partition for this worker from persistent storage (object store)
-        logger.info(f"Partitions working")
-        list_chunks_partitions_obj = scan(
+        partition_obj = scan(
             storage=storage,
             bucket=in_bucket,
             key=key,
@@ -186,49 +185,41 @@ def mapper(
         )
         end = time.time()
         scan_time = end - start
-        logger.info(f"Partitions done")
-        # logger.info(f"Mapper {partition_id} got {len(list_chunks_partitions_obj)} chunks.")
 
-        # Calculate the destination worker for each row
-        list_chunks_hash = []
+        logger.info(f"Mapper {partition_id} got {len(partition_obj)} rows.")
+
         start = time.time()
-
-        for partition_obj in list_chunks_partitions_obj:
-            list_chunks_hash.append(partition(partition=partition_obj,
-                                              segment_info=segment_info,
-                                              sort_key=sort_key))
-
+        # Calculate the destination worker for each row
+        hash_list = partition(partition=partition_obj,
+                              segment_info=segment_info,
+                              sort_key=sort_key)
         end = time.time()
         partition_time = end - start
 
-        # Write the subpartition corresponding to each worker, of each chunk
-        list_subpartitions_chunks = []
         start = time.time()
-
-        for partition_obj, hash_list in zip(list_chunks_partitions_obj, list_chunks_hash):
-            list_subpartitions_chunks.append(serialize_partitions(
-                reduce_partitions,
-                partition_obj,
-                hash_list
-            ))
+        # Write the subpartition corresponding to each worker
+        subpartitions = serialize_partitions(
+            reduce_partitions,
+            partition_obj,
+            hash_list
+        )
 
         futures = []
         loop = asyncio.get_event_loop()
 
-        # For every chunk of the message to send
         timestamp = time.time()
-        for i, subpartition_chunk in enumerate(list_subpartitions_chunks):
-            last_chunk = False
-            if i == len(list_subpartitions_chunks) - 1:
-                last_chunk = True
+        for dest_reducer, data in subpartitions.items():
+            for i, chunk in enumerate(data):
+                last_chunk = False
+                if i == len(data) - 1:
+                    last_chunk = True
 
-            for dest_reducer, data in subpartition_chunk.items():
-                logger.info(f"Data length {len(data)}")
-                logger.info(f"Partition id {partition_id}")
-                logger.info(f"Chunk id {i}")
-                logger.info(f"Last chunk {last_chunk}")
-                # logger.info(f"Data {data}")
-                logger.info(f"Destination reducer {dest_reducer}")
+                # It is alwais between 1MB and 6MB
+                logger.info(f"Mapper --> partition_id: {partition_id}, "
+                            f"chunk_id: {i}, "
+                            f"last_chunk: {last_chunk}, "
+                            f"dest reducer: {dest_reducer},"
+                            f"lenght data: {len(chunk)}")
 
                 dest_server = dest_reducer // burst_size
                 # if same machine, write to shared memory
@@ -241,7 +232,7 @@ def mapper(
                                 "partition_id": partition_id,
                                 "chunk_id": i,
                                 "last_chunk": last_chunk,
-                                "data": data
+                                "data": chunk
                             }
                         )
                     )
@@ -252,7 +243,7 @@ def mapper(
                             publish_and_handle_confirm(
                                 exchange,
                                 f"{queue_prefix}_{dest_reducer}",
-                                data,
+                                chunk,
                                 {
                                     "partition_id": partition_id,
                                     "chunk_id": i,
@@ -270,7 +261,7 @@ def mapper(
                                     Bucket=intermediate_bucket,
                                     Key=f"{timestamp_prefix}/intermediates/{partition_id}",
                                     sufixes=[str(dest_reducer)],
-                                    Body=data
+                                    Body=chunk
                                 )
                             )
                         )
@@ -337,44 +328,35 @@ def reducer(
         async def exchange_read_shared_memory():
             partition_chunks: Dict[str, List[Tuple[int, bytes]]] = defaultdict(list)
             num_partitions = 0
-
             while num_partitions < burst_size:
                 data = queues[partition_id].get(block=True)
-                logger.info(f"partition_id: {data['partition_id']}, "
+                logger.info(f"Reducer --> partition_id: {data['partition_id']}, "
                             f"chunk_id: {data['chunk_id']}, "
-                            f"last_chunk: {data['last_chunk']}")
+                            f"last_chunk: {data['last_chunk']}, "
+                            f"lenght data: {len(data['data'])}")
                 partition_chunks[data['partition_id']].append((data['chunk_id'], data['data']))
             return partition_chunks
-
         async def exchange_read_rabbitmq():
             partition_chunks: Dict[str, List[Tuple[int, bytes]]] = defaultdict(list)
             num_partitions = 0
-
             if map_partitions - burst_size <= 0:
                 return partition_chunks
-
             async with queue.iterator() as queue_iter:
                 async for message in queue_iter:
                     async with message.process():
                         logger.info(f"Received message with headers: {message.headers}")
-
                         partition_chunks[
                             message.headers["partition_id"]
                         ].append((message.headers["chunk_id"], message.body))
-
                         # If last chunk, increment num_partitions
                         if 'last_chunk' in message.headers:
                             num_partitions += 1
-
                         if num_partitions == map_partitions - burst_size:
                             break
-
             return partition_chunks
-
         async def exchange_read_s3():
             map_parts = list(range(map_partitions))
             random.shuffle(map_parts)
-
             loop = asyncio.get_event_loop()
             objects = await asyncio.gather(
                 *[
@@ -392,7 +374,6 @@ def reducer(
                 ]
             )
             return objects
-
         task1 = asyncio.create_task(
             exchange_read_shared_memory()
         )
@@ -406,21 +387,15 @@ def reducer(
             )
         await asyncio.gather(task1, task2)
         timestamp = time.time()
-
         res = []
-
         # Sort chunks by chunk_id and concat them
         for _, chunks in itertools.chain(task1.result().items(), task2.result().items()):
             chunks.sort(key=lambda x: x[0])
             res.extend([chunk[1] for chunk in chunks])
-
         partition_obj = concat_progressive(res)
-
         end = time.time()
         exchange_time = end - start
-
         logger.info(f"Reducer {partition_id} got {len(partition_obj)} rows.")
-
         start = time.time()
         # Sort the partition
         sort(
@@ -429,7 +404,6 @@ def reducer(
         )
         end = time.time()
         sort_time = end - start
-
         start = time.time()
         # Write the partition to persistent storage (object store)
         write(
@@ -441,9 +415,7 @@ def reducer(
         )
         end = time.time()
         write_time = end - start
-
         r = aioredis.from_url(redis_server)
-
         await r.hset(
             f"{run}/reducer/{partition_id}",
             mapping={
@@ -454,9 +426,7 @@ def reducer(
                 "read_finish": timestamp
             }
         )
-
         await r.close()
-
         # storage.put_object(
         #     bucket=timestamp_bucket,
         #     key=f"{timestamp_prefix}/timestamps/reducer_{partition_id}.json",
@@ -467,14 +437,10 @@ def reducer(
         #         "read_finish": timestamp
         #     })
         # )
-
         if use_rabbitmq:
             await channel.close()
             await connection.close()
-
     asyncio.run(_reducer())
-
-
 @click.command()
 @click.argument("rabbitmq_server", type=str, default=os.environ.get("RABBITMQ_SERVER", "localhost"), nargs=1)
 @click.option("--server-id", type=int, default=os.environ.get("SERVER_ID", 0), help="Server ID")
@@ -482,13 +448,9 @@ def reducer(
 @click.option("--run", type=int, default=os.environ.get("RUN", 0), help="Run number")
 def main(rabbitmq_server: str, redis_server: str, server_id: int, run: int):
     setup_logger(log_level=logging.INFO)
-
     if server_id >= (total_workers // burst_size // 2):
         logger.error(f"Server ID {server_id} is invalid. Must be less than {total_workers // burst_size // 2}")
         exit(1)
-
     asyncio.run(test_sort(rabbitmq_server, redis_server, burst_size, total_workers, server_id, run))
-
-
 if __name__ == "__main__":
     main()

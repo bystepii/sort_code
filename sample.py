@@ -67,7 +67,6 @@ class Sample():
             upper_bound = lower_bound + fragment_size
 
             df, part_size, _ = read_and_adjust(storage=self.storage,
-                                               chunk_size=None,
                                                read_bucket=self.bucket,
                                                read_path=self.key,
                                                lower_bound=lower_bound,
