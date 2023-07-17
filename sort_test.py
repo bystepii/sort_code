@@ -214,7 +214,6 @@ def mapper(
                 if i == len(data) - 1:
                     last_chunk = True
 
-                # It is alwais between 1MB and 6MB
                 logger.info(f"Mapper --> partition_id: {partition_id}, "
                             f"chunk_id: {i}, "
                             f"last_chunk: {last_chunk}, "

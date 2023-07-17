@@ -17,6 +17,8 @@ from lithops.storage.utils import StorageNoSuchKeyError
 
 from IO import write_obj, read_obj
 
+import sys
+
 KB = 1024
 MB = 1024 * KB
 GB = 1024 * MB
@@ -145,9 +147,11 @@ def _get_read_range(storage: Storage,
 
 
 def serialize(partition_obj: pd.DataFrame) -> bytes:
+    obj = partition_obj.to_parquet(engine="pyarrow", compression="snappy", index=False)
 
-    return partition_obj.to_parquet(engine="pyarrow", compression="snappy", index=False)
+    byte_chunks = [obj[i:i+MB] for i in range(0, len(obj), MB)]
 
+    return byte_chunks
 
 def deserialize(b: bytes) -> object:
 
@@ -187,21 +191,7 @@ def _serialize_partition(partition_id: int,
 
     obj_pandas = partition_obj.iloc[pointers_ni]
 
-    # Chunking:
-    # Step 1: Calculate the approximate size of each row in bytes
-    row_size = obj_pandas.memory_usage(deep=True).sum() / len(obj_pandas)
-
-    # Step 2: Determine the number of rows per partition for a 1MB size
-    rows_per_partition = int(1e7 / row_size)
-
-    # Step 3: Split the DataFrame into partitions
-    partitions = [obj_pandas[i:i+rows_per_partition] for i in range(0, len(obj_pandas), rows_per_partition)]
-
-    list_obj = []
-    for partition in partitions:
-        list_obj.append(serialize(obj_pandas))
-
-    return list_obj
+    return serialize(obj_pandas)
 
 
 def _writer_multiple_files(
