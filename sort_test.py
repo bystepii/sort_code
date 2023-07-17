@@ -147,7 +147,6 @@ def mapper(
         segment_info: list,
         timestamp_prefix: str
 ):
-    
     async def publish_and_handle_confirm(exchange, queue_name, message_body, headers):
         try:
             confirmation = None
@@ -162,7 +161,7 @@ def mapper(
             print(f"Delivery of message failed with exception: {e}")
         except TimeoutError:
             print(f"Timeout occurred for message")
-                
+
     async def _mapper():
         # setup rabbitmq to reducer
         if use_rabbitmq:
@@ -324,7 +323,7 @@ def reducer(
         start = time.time()
 
         # Read the corresponding subpartitions from each mappers' output, and concat all of them
-        async def exchange_read_shared_memory():
+        def exchange_read_shared_memory():
             partition_chunks: Dict[str, List[Tuple[int, bytes]]] = defaultdict(list)
             num_partitions = 0
             while num_partitions < burst_size:
@@ -332,18 +331,23 @@ def reducer(
                 logger.info(f"Reducer --> partition_id: {data['partition_id']}, "
                             f"chunk_id: {data['chunk_id']}, "
                             f"last_chunk: {data['last_chunk']}, "
-                            f"lenght data: {len(data['data'])}")
+                            f"length data: {len(data['data'])}")
                 partition_chunks[data['partition_id']].append((data['chunk_id'], data['data']))
+                if data['last_chunk']:
+                    num_partitions += 1
             return partition_chunks
+
         async def exchange_read_rabbitmq():
             partition_chunks: Dict[str, List[Tuple[int, bytes]]] = defaultdict(list)
             num_partitions = 0
+            logger.info(f"Reducer {partition_id} waiting for {map_partitions - burst_size} messages via rabbitmq")
             if map_partitions - burst_size <= 0:
                 return partition_chunks
             async with queue.iterator() as queue_iter:
                 async for message in queue_iter:
                     async with message.process():
-                        logger.info(f"Received message with headers: {message.headers}")
+                        logger.info(f"Received message with headers: {message.headers} via rabbitmq with "
+                                    f"body length {len(message.body)}")
                         partition_chunks[
                             message.headers["partition_id"]
                         ].append((message.headers["chunk_id"], message.body))
@@ -352,7 +356,10 @@ def reducer(
                             num_partitions += 1
                         if num_partitions == map_partitions - burst_size:
                             break
+                        logger.info(f"Reducer {partition_id} remaining messages: "
+                                    f"{map_partitions - burst_size - num_partitions} via rabbitmq")
             return partition_chunks
+
         async def exchange_read_s3():
             map_parts = list(range(map_partitions))
             random.shuffle(map_parts)
@@ -373,8 +380,11 @@ def reducer(
                 ]
             )
             return objects
-        task1 = asyncio.create_task(
-            exchange_read_shared_memory()
+
+        loop = asyncio.get_event_loop()
+        task1 = loop.run_in_executor(
+            None,
+            exchange_read_shared_memory
         )
         if use_rabbitmq:
             task2 = asyncio.create_task(
@@ -385,16 +395,23 @@ def reducer(
                 exchange_read_s3()
             )
         await asyncio.gather(task1, task2)
+
         timestamp = time.time()
+
         res = []
         # Sort chunks by chunk_id and concat them
-        for _, chunks in itertools.chain(task1.result().items(), task2.result().items()):
+        for m, chunks in itertools.chain(task1.result().items(), task2.result().items()):
+            logger.info(f"Reducer {partition_id} got {len(chunks)} chunks from mapper {m}")
             chunks.sort(key=lambda x: x[0])
-            res.extend([chunk[1] for chunk in chunks])
+            res.append(b"".join([chunk[1] for chunk in chunks]))
+            logger.info(f"Reducer {partition_id} got {len(res[-1])} bytes from mapper {m}")
         partition_obj = concat_progressive(res)
+
         end = time.time()
         exchange_time = end - start
+
         logger.info(f"Reducer {partition_id} got {len(partition_obj)} rows.")
+
         start = time.time()
         # Sort the partition
         sort(
@@ -403,6 +420,7 @@ def reducer(
         )
         end = time.time()
         sort_time = end - start
+
         start = time.time()
         # Write the partition to persistent storage (object store)
         write(
@@ -414,6 +432,7 @@ def reducer(
         )
         end = time.time()
         write_time = end - start
+
         r = aioredis.from_url(redis_server)
         await r.hset(
             f"{run}/reducer/{partition_id}",
@@ -439,7 +458,10 @@ def reducer(
         if use_rabbitmq:
             await channel.close()
             await connection.close()
+
     asyncio.run(_reducer())
+
+
 @click.command()
 @click.argument("rabbitmq_server", type=str, default=os.environ.get("RABBITMQ_SERVER", "localhost"), nargs=1)
 @click.option("--server-id", type=int, default=os.environ.get("SERVER_ID", 0), help="Server ID")
@@ -451,5 +473,7 @@ def main(rabbitmq_server: str, redis_server: str, server_id: int, run: int):
         logger.error(f"Server ID {server_id} is invalid. Must be less than {total_workers // burst_size // 2}")
         exit(1)
     asyncio.run(test_sort(rabbitmq_server, redis_server, burst_size, total_workers, server_id, run))
+
+
 if __name__ == "__main__":
     main()
