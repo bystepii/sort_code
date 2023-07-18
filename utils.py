@@ -29,11 +29,11 @@ RETRY_WAIT_TIME: float = 0.5
 
 logger = logging.getLogger(__name__)
 
+
 def adjust_bounds(part: Union[str, bytes],
                   start_byte: int,
                   end_byte: int) \
         -> memoryview:
-
     total_size = len(part)
 
     if start_byte > 0:
@@ -67,7 +67,6 @@ def adjust_bounds(part: Union[str, bytes],
 
 def part_to_IO(read_part) \
         -> Union[BytesIO, StringIO]:
-
     if isinstance(read_part, str):
         read_part = StringIO(read_part)
     if isinstance(read_part, bytes) or isinstance(read_part, memoryview):
@@ -86,7 +85,6 @@ def read_and_adjust(storage: Storage,
                     names: List[str] = None,
                     types: Dict[str, str] = None) \
         -> Tuple[pd.DataFrame, int, float]:
-
     lower_bound2 = max(0, lower_bound - BOUND_EXTRACTION_MARGIN)
     upper_bound2 = min(total_size, upper_bound + BOUND_EXTRACTION_MARGIN)
 
@@ -117,9 +115,10 @@ def read_and_adjust(storage: Storage,
 
     return df, part_length, end_time - start_time
 
+
 def get_data_size(storage: Storage,
-                  bucket:str,
-                  path:str) \
+                  bucket: str,
+                  path: str) \
         -> int:
     return int(storage.head_object(bucket, path)['content-length'])
 
@@ -127,7 +126,7 @@ def get_data_size(storage: Storage,
 def _get_read_range(storage: Storage,
                     bucket: str, key: str,
                     partition_id: int,
-                    num_partitions: int)\
+                    num_partitions: int) \
         -> Tuple[int, int]:
     """
     Calculate byte range to read from a dataset, given the id of the partition.
@@ -146,27 +145,25 @@ def _get_read_range(storage: Storage,
     return lower_bound, upper_bound
 
 
-def serialize(partition_obj: pd.DataFrame) -> bytes:
+def serialize(partition_obj: pd.DataFrame) -> List[bytes]:
     obj = partition_obj.to_parquet(engine="pyarrow", compression="snappy", index=False)
 
-    byte_chunks = [obj[i:i+MB] for i in range(0, len(obj), MB)]
+    byte_chunks = [obj[i:i + MB] for i in range(0, len(obj), MB)]
 
     return byte_chunks
 
-def deserialize(b: bytes) -> object:
 
+def deserialize(b: bytes) -> object:
     return pd.read_parquet(io.BytesIO(b), engine="pyarrow")
 
 
 def serialize_partitions(num_partitions: int,
                          partition_obj: pd.DataFrame,
-                         hash_list: np.ndarray)\
-        -> Dict[int, bytes]:
-
+                         hash_list: np.ndarray) \
+        -> Dict[int, List[bytes]]:
     serialized_partitions = {}
 
     for destination_partition in range(num_partitions):
-
         serialization_result = _serialize_partition(destination_partition,
                                                     partition_obj,
                                                     hash_list)
@@ -180,10 +177,8 @@ def serialize_partitions(num_partitions: int,
 
 def _serialize_partition(partition_id: int,
                          partition_obj: pd.DataFrame,
-                         hash_list: np.ndarray)\
-        -> bytes:
-
-
+                         hash_list: np.ndarray) \
+        -> List[bytes]:
     # Get rows corresponding to this worker
     pointers_ni = np.where(hash_list == partition_id)[0]
 
@@ -199,7 +194,6 @@ def _writer_multiple_files(
         subpartitions: Dict[int, bytes],
         partition_id: int,
         bucket: str):
-
     async def _writes(_subpartitions):
         loop = asyncio.get_event_loop()
 
@@ -223,7 +217,6 @@ def _writer_multiple_files(
 def concat_progressive(
         subpartitions: List[bytes]) \
         -> pd.DataFrame:
-
     df = None
 
     for r_i, r in enumerate(subpartitions):
@@ -248,7 +241,6 @@ def reader(source_partition: int,
            storage: Storage,
            prefix: str) \
         -> bytes:
-
     retry = 0
 
     before_readt = time.time()

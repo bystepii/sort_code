@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from multiprocessing import Pool, Queue, Manager
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import click
 import cloudpickle as pickle
@@ -217,7 +217,7 @@ def mapper(
                             f"chunk_id: {i}, "
                             f"last_chunk: {last_chunk}, "
                             f"dest reducer: {dest_reducer},"
-                            f"lenght data: {len(chunk)}")
+                            f"length data: {len(chunk)}")
 
                 dest_server = dest_reducer // burst_size
                 # if same machine, write to shared memory
@@ -324,21 +324,30 @@ def reducer(
 
         # Read the corresponding subpartitions from each mappers' output, and concat all of them
         def exchange_read_shared_memory():
-            partition_chunks: Dict[str, List[Tuple[int, bytes]]] = defaultdict(list)
+            partition_chunks: Dict[int, List[Dict]] = defaultdict(list)
             num_partitions = 0
             while num_partitions < burst_size:
                 data = queues[partition_id].get(block=True)
-                logger.info(f"Reducer --> partition_id: {data['partition_id']}, "
+                m = int(data['partition_id'])
+                logger.info(f"Reducer {partition_id} --> from mapper: {m}, "
                             f"chunk_id: {data['chunk_id']}, "
                             f"last_chunk: {data['last_chunk']}, "
                             f"length data: {len(data['data'])}")
-                partition_chunks[data['partition_id']].append((data['chunk_id'], data['data']))
-                if data['last_chunk']:
-                    num_partitions += 1
+                partition_chunks[m].append(data)
+
+                # check if last chunk is received
+                try:
+                    index = [d['last_chunk'] for d in partition_chunks[m]].index(True)
+
+                    # if last chunk is received, check if all chunks are received
+                    if len(partition_chunks[m]) == partition_chunks[m][index]['chunk_id'] + 1:
+                        num_partitions += 1
+                except ValueError:
+                    pass
             return partition_chunks
 
         async def exchange_read_rabbitmq():
-            partition_chunks: Dict[str, List[Tuple[int, bytes]]] = defaultdict(list)
+            partition_chunks: Dict[int, List[Dict]] = defaultdict(list)
             num_partitions = 0
             logger.info(f"Reducer {partition_id} waiting for {map_partitions - burst_size} messages via rabbitmq")
             if map_partitions - burst_size <= 0:
@@ -348,12 +357,24 @@ def reducer(
                     async with message.process():
                         logger.info(f"Received message with headers: {message.headers} via rabbitmq with "
                                     f"body length {len(message.body)}")
-                        partition_chunks[
-                            message.headers["partition_id"]
-                        ].append((message.headers["chunk_id"], message.body))
-                        # If last chunk, increment num_partitions
-                        if 'last_chunk' in message.headers:
-                            num_partitions += 1
+                        m = int(message.headers["partition_id"])
+                        partition_chunks[m].append({
+                            "partition_id": m,
+                            "chunk_id": int(message.headers["chunk_id"]),
+                            "last_chunk": message.headers["last_chunk"],
+                            "data": message.body
+                        })
+
+                        # check if last chunk is received
+                        try:
+                            index = [d['last_chunk'] for d in partition_chunks[m]].index(True)
+
+                            # if last chunk is received, check if all chunks are received
+                            if len(partition_chunks[m]) == partition_chunks[m][index]['chunk_id'] + 1:
+                                num_partitions += 1
+                        except ValueError:
+                            pass
+
                         if num_partitions == map_partitions - burst_size:
                             break
                         logger.info(f"Reducer {partition_id} remaining messages: "
@@ -402,8 +423,8 @@ def reducer(
         # Sort chunks by chunk_id and concat them
         for m, chunks in itertools.chain(task1.result().items(), task2.result().items()):
             logger.info(f"Reducer {partition_id} got {len(chunks)} chunks from mapper {m}")
-            chunks.sort(key=lambda x: x[0])
-            res.append(b"".join([chunk[1] for chunk in chunks]))
+            chunks.sort(key=lambda x: x["chunk_id"])
+            res.append(b"".join([chunk["data"] for chunk in chunks]))
             logger.info(f"Reducer {partition_id} got {len(res[-1])} bytes from mapper {m}")
         partition_obj = concat_progressive(res)
 
