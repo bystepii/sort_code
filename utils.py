@@ -15,6 +15,9 @@ from io import BytesIO, StringIO
 import numpy as np
 from lithops.storage.utils import StorageNoSuchKeyError
 
+import sys
+import funcy
+
 from IO import write_obj, read_obj
 
 import sys
@@ -145,11 +148,42 @@ def _get_read_range(storage: Storage,
 
     return lower_bound, upper_bound
 
+def chunked(size, source):
+    for i in range(0, len(source), size):
+        yield source[i:i+size]
 
-def serialize(partition_obj: pd.DataFrame) -> bytes:
+def serialize(partition_obj: pd.DataFrame) -> list[bytes]:
     obj = partition_obj.to_parquet(engine="pyarrow", compression="snappy", index=False)
 
-    byte_chunks = [obj[i:i+MB] for i in range(0, len(obj), MB)]
+    byte_chunks = []
+
+    logger.info(f"SIZE PRECHUNKING: {len(obj)}")
+
+    # METHOD 1
+    """for i in range(0, len(obj), MB):
+        if (i + MB - 1) <= len(obj):
+            logger.info(f"LENGHT: {i}-{i + MB - 1}")
+            byte_chunks.append(obj[i : i + MB - 1])
+        else:
+            logger.info(f"LENGHT: {i}-{len(obj)}")
+            byte_chunks.append(obj[i : len(obj)])"""
+    
+    # METHOD 2
+    byte_chunks = list(chunked(MB, obj))
+
+    # METHOD 3
+    # byte_chunks = list(funcy.chunks(MB, obj))
+    
+    # METHOD 4
+    # chunk_fn = lambda b,sz:[b[i*sz:(i+1)*sz] for i in range(int(len(b)/sz)+1)]    
+    # byte_chunks = chunk_fn(obj,MB)
+
+    sum_size = 0
+
+    for chunk in byte_chunks:
+        sum_size = sum_size + len(chunk)
+
+    logger.info(f"SIZE POSTCHUNKING: {sum_size}")
 
     return byte_chunks
 
@@ -161,7 +195,7 @@ def deserialize(b: bytes) -> object:
 def serialize_partitions(num_partitions: int,
                          partition_obj: pd.DataFrame,
                          hash_list: np.ndarray)\
-        -> Dict[int, bytes]:
+        -> Dict[int, list[bytes]]:
 
     serialized_partitions = {}
 
@@ -181,7 +215,7 @@ def serialize_partitions(num_partitions: int,
 def _serialize_partition(partition_id: int,
                          partition_obj: pd.DataFrame,
                          hash_list: np.ndarray)\
-        -> bytes:
+        -> list[bytes]:
 
 
     # Get rows corresponding to this worker
