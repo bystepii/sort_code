@@ -10,7 +10,7 @@ use_rabbitmq = True
 
 key = "terasort-1g"
 
-burst_size = 8
+burst_size = 4
 total_workers = 16
 
 exchange_name = 'sort'

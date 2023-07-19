@@ -152,6 +152,9 @@ def serialize(partition_obj: pd.DataFrame) -> List[bytes]:
 
     return byte_chunks
 
+def serialize_reducer(partition_obj: pd.DataFrame) -> bytes:
+    return partition_obj.to_parquet(engine="pyarrow", compression="snappy", index=False)
+
 
 def deserialize(b: bytes) -> object:
     return pd.read_parquet(io.BytesIO(b), engine="pyarrow")
