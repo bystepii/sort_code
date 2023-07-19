@@ -208,6 +208,23 @@ def mapper(
 
         timestamp = time.time()
         for dest_reducer, data in subpartitions.items():
+            dest_server = dest_reducer // burst_size
+            if not use_rabbitmq and dest_server != server_id:
+                # write to s3
+                futures.append(
+                    loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            write_obj,
+                            storage=storage,
+                            Bucket=intermediate_bucket,
+                            Key=f"{timestamp_prefix}/intermediates/{partition_id}",
+                            sufixes=[str(dest_reducer)],
+                            Body=b''.join(data)
+                        )
+                    )
+                )
+                continue
             for i, chunk in enumerate(data):
                 last_chunk = False
                 if i == len(data) - 1:
@@ -219,7 +236,6 @@ def mapper(
                             f"dest reducer: {dest_reducer},"
                             f"length data: {len(chunk)}")
 
-                dest_server = dest_reducer // burst_size
                 # if same machine, write to shared memory
                 if dest_server == server_id:
                     futures.append(
@@ -247,20 +263,6 @@ def mapper(
                                     "chunk_id": i,
                                     "last_chunk": last_chunk,
                                 }
-                            )
-                        )
-                    else:
-                        futures.append(
-                            loop.run_in_executor(
-                                None,
-                                functools.partial(
-                                    write_obj,
-                                    storage=storage,
-                                    Bucket=intermediate_bucket,
-                                    Key=f"{timestamp_prefix}/intermediates/{partition_id}",
-                                    sufixes=[str(dest_reducer)],
-                                    Body=chunk
-                                )
                             )
                         )
         await asyncio.gather(*futures)
@@ -382,7 +384,8 @@ def reducer(
             return partition_chunks
 
         async def exchange_read_s3():
-            map_parts = list(range(map_partitions))
+            # except for the partition in the same server
+            map_parts = list(set(range(map_partitions)) - {partition_id})
             random.shuffle(map_parts)
             loop = asyncio.get_event_loop()
             objects = await asyncio.gather(
@@ -420,12 +423,23 @@ def reducer(
         timestamp = time.time()
 
         res = []
-        # Sort chunks by chunk_id and concat them
-        for m, chunks in itertools.chain(task1.result().items(), task2.result().items()):
+
+        if use_rabbitmq:
+            objects = itertools.chain(task1.result().items(), task2.result().items())
+        else:
+            objects = task1.result().items()
+            logger.info(f"Reducer {partition_id} got {len(objects)} objects from shared memory")
+            r = task2.result()
+            t = [type(x) for x in r]
+            logger.info(f"Reducer {partition_id} got {len(r)} objects from s3: {t}")
+            res.extend(r)
+
+        for m, chunks in objects:
             logger.info(f"Reducer {partition_id} got {len(chunks)} chunks from mapper {m}")
             chunks.sort(key=lambda x: x["chunk_id"])
             res.append(b"".join([chunk["data"] for chunk in chunks]))
             logger.info(f"Reducer {partition_id} got {len(res[-1])} bytes from mapper {m}")
+
         partition_obj = concat_progressive(res)
 
         end = time.time()

@@ -24,7 +24,7 @@ MB = 1024 * KB
 GB = 1024 * MB
 BOUND_EXTRACTION_MARGIN = KB
 MAX_RETRIES: int = 15
-MAX_READ_TIME: int = 30
+MAX_READ_TIME: int = 60
 RETRY_WAIT_TIME: float = 0.5
 
 logger = logging.getLogger(__name__)
