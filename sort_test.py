@@ -385,7 +385,9 @@ def reducer(
 
         async def exchange_read_s3():
             # except for the partition in the same server
-            map_parts = list(set(range(map_partitions)) - {partition_id})
+            process_range = range(burst_size * server_id, burst_size * (server_id + 1))
+            map_parts = list(set(range(map_partitions)) - set(process_range))
+            logger.info(f"Reducer {partition_id} waiting for {len(map_parts)} messages via s3 ({map_parts})")
             random.shuffle(map_parts)
             loop = asyncio.get_event_loop()
             objects = await asyncio.gather(
