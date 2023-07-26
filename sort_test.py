@@ -7,7 +7,7 @@ import random
 import time
 from collections import defaultdict
 from datetime import datetime
-from multiprocessing import Pool, Queue, Manager
+from multiprocessing import Queue, Manager, Process
 from typing import Dict, List
 
 import click
@@ -100,36 +100,122 @@ async def test_sort(
     timestamp_prefix = f"{timestamp}-{run}"
 
     queues = {
-        partition_id: m.Queue()
+        partition_id: Queue()
         for partition_id in process_range
     }
 
+    # if not parallel:
+    #     with Pool(processes=burst_size) as pool:
+    #         pool.starmap(mapper, [
+    #             (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
+    #              server_id, reduce_partitions, segment_info, timestamp_prefix)
+    #             for partition_id in process_range
+    #         ])
+    #         pool.starmap(reducer, [
+    #             (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
+    #              server_id, timestamp_prefix)
+    #             for partition_id in process_range
+    #         ])
+    # else:
+    #     with Pool(processes=burst_size * 2) as pool:
+    #         f1 = pool.starmap_async(mapper, [
+    #             (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
+    #              server_id, reduce_partitions, segment_info, timestamp_prefix)
+    #             for partition_id in process_range
+    #         ])
+    #         f2 = pool.starmap_async(reducer, [
+    #             (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
+    #              server_id, timestamp_prefix)
+    #             for partition_id in process_range
+    #         ])
+    #         f1.get()
+    #         f2.get()
+
     if not parallel:
-        with Pool(processes=burst_size) as pool:
-            pool.starmap(mapper, [
-                (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
-                 server_id, reduce_partitions, segment_info, timestamp_prefix)
-                for partition_id in process_range
-            ])
-            pool.starmap(reducer, [
-                (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
-                 server_id, timestamp_prefix)
-                for partition_id in process_range
-            ])
+        mapper_processes = []
+        reducer_processes = []
+        for partition_id in process_range:
+            p = Process(
+                target=mapper,
+                args=(
+                    rabbitmq_server,
+                    redis_server,
+                    run,
+                    queues,
+                    exchange_name,
+                    map_partitions,
+                    partition_id,
+                    server_id,
+                    reduce_partitions,
+                    segment_info,
+                    timestamp_prefix
+                )
+            )
+            mapper_processes.append(p)
+        for p in mapper_processes:
+            p.start()
+        for p in mapper_processes:
+            p.join()
+        for partition_id in process_range:
+            p = Process(
+                target=reducer,
+                args=(
+                    rabbitmq_server,
+                    redis_server,
+                    run,
+                    queues,
+                    exchange_name,
+                    map_partitions,
+                    partition_id,
+                    server_id,
+                    timestamp_prefix
+                )
+            )
+            reducer_processes.append(p)
+        for p in reducer_processes:
+            p.start()
+        for p in reducer_processes:
+            p.join()
     else:
-        with Pool(processes=burst_size * 2) as pool:
-            f1 = pool.starmap_async(mapper, [
-                (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
-                 server_id, reduce_partitions, segment_info, timestamp_prefix)
-                for partition_id in process_range
-            ])
-            f2 = pool.starmap_async(reducer, [
-                (rabbitmq_server, redis_server, run, queues, exchange_name, map_partitions, partition_id,
-                 server_id, timestamp_prefix)
-                for partition_id in process_range
-            ])
-            f1.get()
-            f2.get()
+        processes = []
+        for partition_id in process_range:
+            p = Process(
+                target=mapper,
+                args=(
+                    rabbitmq_server,
+                    redis_server,
+                    run,
+                    queues,
+                    exchange_name,
+                    map_partitions,
+                    partition_id,
+                    server_id,
+                    reduce_partitions,
+                    segment_info,
+                    timestamp_prefix
+                )
+            )
+            processes.append(p)
+        for partition_id in process_range:
+            p = Process(
+                target=reducer,
+                args=(
+                    rabbitmq_server,
+                    redis_server,
+                    run,
+                    queues,
+                    exchange_name,
+                    map_partitions,
+                    partition_id,
+                    server_id,
+                    timestamp_prefix
+                )
+            )
+            processes.append(p)
+        for p in processes:
+            p.start()
+        for p in processes:
+            p.join()
 
     logger.info("==================== DONE ====================")
 
@@ -154,7 +240,7 @@ def mapper(
                 confirmation = await exchange.publish(
                     Message(message_body, headers=headers),
                     routing_key=queue_name,
-                    timeout=3.0,
+                    timeout=10.0,
                 )
             logger.info(f"Acknowledgement received for message!")
         except DeliveryError as e:
@@ -451,6 +537,7 @@ def reducer(
 
         start = time.time()
         # Sort the partition
+        logger.info(f"Reducer {partition_id} sorting")
         sort(
             partition_obj=partition_obj,
             sort_key=sort_key
@@ -460,6 +547,7 @@ def reducer(
 
         start = time.time()
         # Write the partition to persistent storage (object store)
+        logger.info(f"Reducer {partition_id} writing to s3")
         write(
             storage=storage,
             partition_obj=partition_obj,
@@ -470,6 +558,7 @@ def reducer(
         end = time.time()
         write_time = end - start
 
+        logger.info(f"Reducer {partition_id} finished, writing timestamps to redis")
         r = aioredis.from_url(redis_server)
         await r.hset(
             f"{run}/reducer/{partition_id}",
